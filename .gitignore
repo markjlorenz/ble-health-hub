@@ -1,2 +1,2 @@
 # Large vendor APK (exceeds GitHub 100MB limit)
-iHealth MyVitals_4.13.1_APKPure.apk
+vendor/ihealth/*.apk
