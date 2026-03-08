@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>BLE Health Hub — Pulse Ox (Web Bluetooth)</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <main class="container">
+      <header class="header">
+        <h1>Pulse Oximeter (Web Bluetooth)</h1>
+        <p class="subtle">
+          Connects to the vendor-specific pulse ox and decodes its 20-byte live
+          measurement frames.
+        </p>
+      </header>
+
+      <section class="card">
+        <div class="row">
+          <button id="connectBtn" class="btn">Connect</button>
+          <button id="disconnectBtn" class="btn btn-secondary" disabled>
+            Disconnect
+          </button>
+        </div>
+
+        <div class="grid">
+          <div>
+            <div class="label">Status</div>
+            <div id="status" class="mono">Idle</div>
+          </div>
+          <div>
+            <div class="label">Device</div>
+            <div id="device" class="mono">—</div>
+          </div>
+          <div>
+            <div class="label">Service UUID</div>
+            <div id="serviceUuid" class="mono">—</div>
+          </div>
+          <div>
+            <div class="label">Measurement Characteristic</div>
+            <div id="measurementChar" class="mono">—</div>
+          </div>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="values">
+          <div class="value">
+            <div class="label">SpO₂</div>
+            <div id="spo2" class="big">—</div>
+          </div>
+          <div class="value">
+            <div class="label">Heart Rate</div>
+            <div id="hr" class="big">—</div>
+          </div>
+          <div class="value">
+            <div class="label">Signal</div>
+            <div id="strength" class="big">—</div>
+          </div>
+        </div>
+
+        <div class="grid">
+          <div>
+            <div class="label">Pleth (last 3 samples)</div>
+            <div id="pleth" class="mono">—</div>
+          </div>
+          <div>
+            <div class="label">Frame</div>
+            <div id="frameMeta" class="mono">—</div>
+          </div>
+          <div class="span2">
+            <div class="label">Raw (hex)</div>
+            <div id="rawHex" class="mono">—</div>
+          </div>
+        </div>
+
+        <p class="subtle small">
+          Notes: Web Bluetooth works in Chromium browsers (Chrome/Edge) on a
+          secure context (HTTPS or <span class="mono">http://localhost</span>).
+        </p>
+      </section>
+
+      <section class="card">
+        <details>
+          <summary>Debug log</summary>
+          <div class="row log-actions">
+            <button id="copyLogBtn" class="btn btn-secondary" type="button">
+              Copy log
+            </button>
+          </div>
+          <pre id="log" class="log" aria-live="polite"></pre>
+        </details>
+      </section>
+    </main>
+
+    <script type="module" src="./app.js?v=47"></script>
+  </body>
+</html>
