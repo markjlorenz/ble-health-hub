@@ -191,6 +191,42 @@ const NON_FRAME_LOG_LIMIT = 12;
 
 let postHandshakeDebugUntilMs = 0;
 
+// --- Streaming display smoothing ---
+const HR_SMOOTH_WINDOW = 15;
+const SPO2_SMOOTH_WINDOW = 9;
+let hrHistory = [];
+let spo2History = [];
+// (Removed) lastSpo2Displayed: we avoid heuristic "pick closest" decoding.
+
+// PO3 PI (“perfusion index”) state: APK uses a static last-good value fallback.
+let lastGoodPi = 0.0;
+
+function median(values) {
+  if (!Array.isArray(values) || values.length === 0) {
+    return null;
+  }
+  const sorted = values.slice().sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  if (sorted.length % 2 === 1) {
+    return sorted[mid];
+  }
+  return (sorted[mid - 1] + sorted[mid]) / 2.0;
+}
+
+function pushBounded(arr, value, maxLen) {
+  if (!Number.isFinite(value)) {
+    return;
+  }
+  arr.push(value);
+  while (arr.length > maxLen) {
+    arr.shift();
+  }
+}
+
+function u16le(u8, i) {
+  return (u8[i] & 0xff) | ((u8[i + 1] & 0xff) << 8);
+}
+
 // --- Logging (Wireshark-like capture row) ---
 // Format: <relative-seconds>  <message>  <direction>  <hex bytes>
 // Example:
@@ -760,24 +796,42 @@ function decodeVendorMeasurementFrame(u8) {
   const type = u8[2];
 
   const seq = u8[3];
-  const sessionHex = toHex(u8.slice(4, 8));
+  // Header bytes observed on-wire (A0 11 F0 ...):
+  //   [0]=0xA0 (prefix)
+  //   [1]=0x11 (payload length)
+  //   [2]=0xF0 (type)
+  //   [3]=seq
+  //   [4..5]=opaque/session-ish bytes (varies)
+  // APK-backed PO3 live decode expects a 13-byte payload that begins at offset 6:
+  //   b0 SpO2 (unsigned)
+  //   b1 HR (unsigned)
+  //   b2 pulse strength (unsigned)
+  //   le16[0] PI numerator
+  //   le16[1] PI denominator
+  //   le16[2..4] pulseWave (3 points)
+  const sessionHex = toHex(u8.slice(4, 6));
 
-  const strength = u8[8];
-  // u8[9] is direct SpO2 percentage (confirmed from pcap2 — values 0x5b-0x64 = 91-100%).
-  // Earlier code incorrectly added +50.
-  const spo2 = u8[9];
+  const spo2Raw = u8[6] & 0xff;
+  const spo2 = spo2Raw;
+  const hrBpm = (u8[7] & 0xff) * 1.0;
+  const strength = u8[8] & 0xff;
 
-  // bytes 10-11 are constant/config (usually 00 E8)
-  const config = (u8[10] << 8) | u8[11];
+  const piNum = u16le(u8, 9);
+  const piDen = u16le(u8, 11);
 
-  const hr10 = (u8[12] << 8) | u8[13];
-  const hrBpm = hr10 / 10.0;
+  const pleth = [u16le(u8, 13), u16le(u8, 15), u16le(u8, 17)];
 
-  const pleth = [
-    (u8[14] << 8) | u8[15],
-    (u8[16] << 8) | u8[17],
-    (u8[18] << 8) | u8[19],
-  ];
+  let pi = null;
+  if (spo2Raw !== 0 && hrBpm !== 0 && piDen !== 0) {
+    const candidate = Math.round((piNum / piDen) * 1000) / 10.0;
+    if (candidate >= 0.2 && candidate <= 20.0) {
+      lastGoodPi = candidate;
+      pi = candidate;
+    } else {
+      // APK behavior: fall back to last known-good value.
+      pi = lastGoodPi;
+    }
+  }
 
   const valid = !(strength === 0 || (pleth[0] === 0 && pleth[1] === 0 && pleth[2] === 0));
 
@@ -786,10 +840,13 @@ function decodeVendorMeasurementFrame(u8) {
     seq,
     sessionHex,
     strength,
+    spo2Raw,
     spo2,
-    config,
     hrBpm,
     pleth,
+    pi,
+    piNum,
+    piDen,
     valid,
   };
 }
@@ -799,11 +856,8 @@ function looksLikeMeasurementFrame(decoded) {
     return false;
   }
 
-  // Strong signal from the capture/README: measurement frames had config 0x00E8
-  // and strength in 0..8.
-  if (decoded.config !== 0x00e8) {
-    return false;
-  }
+  // The APK’s PO3 live-data path corresponds to A0 11 F0 frames.
+  if (decoded.type !== 0xf0) return false;
   if (!Number.isFinite(decoded.hrBpm) || decoded.hrBpm <= 0 || decoded.hrBpm > 250) {
     return false;
   }
@@ -841,6 +895,9 @@ function onDisconnected() {
   setStatus("Disconnected");
 
   vendorHandshakeComplete = false;
+
+  hrHistory = [];
+  spo2History = [];
 
   gattServer = null;
   measurementCharacteristic = null;
@@ -1053,10 +1110,10 @@ function onCharacteristicValueChanged(event) {
             continue;
           }
 
-          // Primary path: A0 11 F0 (per README/pcap)
-          // Fallback: accept other A0 11 types only if they look exactly like
-          // a measurement payload.
-          if (decoded.type === 0xf0 || looksLikeMeasurementFrame(decoded)) {
+          // Accept frames only if they match the measurement signature.
+          // Do NOT special-case decoded.type === 0xF0; some firmwares may reuse
+          // types with different payload layouts.
+          if (looksLikeMeasurementFrame(decoded)) {
             foundMeasurement = true;
             const typeHex = decoded.type.toString(16).padStart(2, "0");
             if (!firstMeasurementLogged) {
@@ -1093,13 +1150,24 @@ function onCharacteristicValueChanged(event) {
           })();
         }
 
-            el.spo2.textContent = `${decoded.spo2}%`;
-            el.hr.textContent = `${decoded.hrBpm.toFixed(1)} bpm`;
+            // Apply lightweight smoothing to match the device's steadier UI.
+            if (decoded.valid) {
+              pushBounded(hrHistory, decoded.hrBpm, HR_SMOOTH_WINDOW);
+              pushBounded(spo2History, decoded.spo2, SPO2_SMOOTH_WINDOW);
+            }
+
+            const hrSmoothed = median(hrHistory) ?? decoded.hrBpm;
+            const spo2Smoothed = median(spo2History) ?? decoded.spo2;
+
+            el.spo2.textContent = `${Math.round(spo2Smoothed)}%`;
+            el.hr.textContent = `${hrSmoothed.toFixed(1)} bpm`;
             el.strength.textContent = `${decoded.strength}/8`;
             el.pleth.textContent = `[${decoded.pleth.join(", ")}]`;
-            el.frameMeta.textContent = `type=0x${typeHex} seq=${decoded.seq} session=${decoded.sessionHex} config=0x${decoded.config
-              .toString(16)
-              .padStart(4, "0")} ${decoded.valid ? "valid" : "weak"}`;
+            const piStr =
+              decoded.pi == null || !Number.isFinite(decoded.pi)
+                ? "—"
+                : decoded.pi.toFixed(1);
+            el.frameMeta.textContent = `type=0x${typeHex} seq=${decoded.seq} hdr=${decoded.sessionHex} pi=${piStr} (n=${decoded.piNum} d=${decoded.piDen}) ${decoded.valid ? "valid" : "weak"}`;
             el.rawHex.textContent = rawHex;
           }
         }
@@ -1432,6 +1500,8 @@ async function connect() {
     };
     lastFrameAtMs = 0;
     firstMeasurementLogged = false;
+    hrHistory = [];
+    spo2History = [];
     a011TypeLogCounts.clear();
     void runVendorHandshake(handshake.cancelToken);
 

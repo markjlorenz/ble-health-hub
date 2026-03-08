@@ -4,3 +4,6 @@ vendor/ihealth/*.apk
 # macOS metadata
 .DS_Store
 **/.DS_Store
+
+# Local scratch space (ignored)
+tmp/

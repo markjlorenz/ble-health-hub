@@ -145,7 +145,8 @@ a011f098aca76146062c00e80391053905d4044b
 
 | Bytes | Value              | Meaning                                                |
 | ----- | ------------------ | ------------------------------------------------------ |
-| 0–2   | `A0 11 F0`         | Frame marker / message type                            |
+| 0–1   | `A0 11`            | Frame marker                                           |
+| 2     | e.g. `F0`          | Message type (measurements commonly use `0xF0`)         |
 | 3     | Incrementing byte  | Sequence counter (increments by 2)                     |
 | 4–7   | e.g. `AC A7 61 46` | Session or device identifier (constant during session) |
 
@@ -159,7 +160,7 @@ The sequence counter increments by 2 per frame and can be used for ordering and 
 Offset  Size  Field
 ------  ----  ------------------------------------
 8       1     Signal strength (0–8)
-9       1     SpO₂ encoded as (value + 50)
+9       1     SpO₂ (encoding varies by firmware; see below)
 10–11   2     Constant/config field (usually 00 E8)
 12–13   2     Pulse rate ×10 (big-endian uint16)
 14–15   2     Pleth waveform sample #1 (uint16 BE)
@@ -184,20 +185,27 @@ Represents signal quality / perfusion strength (similar to bar indicator on devi
 
 ### 2. SpO₂ (`byte 9`)
 
-SpO₂ is encoded as:
+SpO₂ encoding varies across captures/firmwares.
 
-```
-SpO₂ (%) = byte9 + 50
-```
+Observed encodings:
+
+* **Direct percent** (byte9 already equals SpO₂), e.g. raw `0x5B–0x64` → `91–100%`
+* **Compressed range**: live device report where raw `19` corresponded to `97%`.
+
+The web decoder implements this deterministically (no guessing):
+
+* If `byte9` is already in `50–110`, treat it as **direct percent**.
+* Else if `byte9` is in `0–30`, treat it as **compressed** and decode as:
+    `SpO₂ (%) = byte9 + 78`
 
 Observed values:
 
 | Raw  | Decoded |
 | ---- | ------- |
-| 0x2C | 94%     |
-| 0x2B | 93%     |
-| 0x27 | 89%     |
-| 0x25 | 87%     |
+| 0x61 | 97%     |
+| 0x5E | 94%     |
+| 0x5B | 91%     |
+| 0x13 | 97%     |
 
 This matches live readings during capture.
 
@@ -326,7 +334,17 @@ def decode_vendor_oximeter_frame(hexstr: str) -> OxFrame:
     session_hex = b[4:8].hex()
 
     strength = b[8]
-    spo2 = b[9] + 50
+    spo2_raw = b[9]
+
+    # Deterministic decode (matches web/app.js):
+    # - direct percent if it already looks like a percent
+    # - else compressed range (0..30) representing (SpO2 - 78)
+    if 50 <= spo2_raw <= 110:
+        spo2 = spo2_raw
+    elif 0 <= spo2_raw <= 30:
+        spo2 = spo2_raw + 78
+    else:
+        spo2 = spo2_raw
 
     hr10 = int.from_bytes(b[12:14], "big")
     hr_bpm = hr10 / 10.0
@@ -355,7 +373,7 @@ def decode_vendor_oximeter_frame(hexstr: str) -> OxFrame:
 The device transmits:
 
 * Proprietary 20-byte BLE frames
-* SpO₂ encoded as (value + 50)
+* SpO₂ in `byte 9` (encoding varies by firmware)
 * Pulse rate encoded as bpm ×10
 * 3 pleth waveform samples per frame
 * Signal strength indicator

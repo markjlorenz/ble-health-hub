@@ -10,6 +10,42 @@ Generated from the capture files in `data/`. Each section starts at the first ce
 
 Direction glyphs: 🟦C→P (central write), 🟩P→C (peripheral notify/indicate)
 
+## PO3 live measurement decode (APK-backed)
+
+The official MyVitals 4.13.1 APK decodes PO3 live streaming via:
+
+`Po3Control → AcInsSet.haveNewData(...) → POMethod.c(byte[]) → POMethod.a(int[])` (action: `liveData_po`).
+
+For the 20-byte vendor measurement notifications seen in these pcaps (`a0 11 f0 …`), the APK’s 13-byte `POMethod` payload starts at byte offset **6** in the 20-byte frame:
+
+```text
+offset  meaning                         type
+------  ------------------------------  -----------------
+0       0xA0                            frame prefix
+1       0x11                            length (20 bytes)
+2       0xF0                            measurement type
+3       seq                             u8
+4..5    opaque header bytes             u8[2]
+6       SpO2 (%)                        u8 (unsigned)
+7       HR (bpm)                        u8 (unsigned)
+8       pulse strength                  u8 (0..8 typical)
+9..10   PI numerator                    u16 little-endian
+11..12  PI denominator                  u16 little-endian
+13..14  pulseWave[0]                    u16 little-endian
+15..16  pulseWave[1]                    u16 little-endian
+17..18  pulseWave[2]                    u16 little-endian
+19      checksum / trailing byte        u8 (unused here)
+```
+
+Notes:
+
+- There is **no** `+78` SpO₂ mapping in this APK-backed PO3 decoder; SpO₂ is read directly as an unsigned byte.
+- PI computation matches the APK:
+
+	$$pi = \mathrm{round}((piNum/piDen)\cdot 1000) / 10$$
+
+	Only accept values in the range $[0.2, 20.0]$; otherwise fall back to the last known-good PI.
+
 ## data/pulse-ox-2.pcapng
 
 Start: frame 838 at capture t=14.975502s (shown below as t=0.000000). Matched start write: `b0111101acfa293dbdd4d28fb10f5a953ab8d182`
