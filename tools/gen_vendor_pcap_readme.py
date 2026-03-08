@@ -8,7 +8,9 @@ writes + notifications) with timestamps and direction.
 It uses tshark in Docker (cincan/tshark) to avoid local Wireshark dependencies.
 
 Usage:
-  python3 tools/gen_vendor_pcap_readme.py > VENDOR_PCAP_LOGS_README.markdown
+    python3 tools/gen_vendor_pcap_readme.py > tmp/vendor_pcap_timelines.markdown
+
+    (The canonical, curated timelines + protocol notes live in PULSE_OX_README.markdown.)
 
 Notes:
 - Time is reported as seconds since the matching central write per run.
