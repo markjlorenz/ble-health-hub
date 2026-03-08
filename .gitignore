@@ -1,2 +1,6 @@
 # Large vendor APK (exceeds GitHub 100MB limit)
 vendor/ihealth/*.apk
+
+# macOS metadata
+.DS_Store
+**/.DS_Store
