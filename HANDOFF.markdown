@@ -27,6 +27,13 @@ The current blocker: the Web Bluetooth app can complete the vendor handshake and
   - `web/app.js`: BLE connect + handshake + decode
   - `web/style.css`: styling
 
+## Vendor APK availability
+
+The vendor APK is not committed to git (GitHub blocks >100MB files, and APKs are typically proprietary).
+
+- If you have permission to share it, attach it to a **GitHub Release asset** for this repo and record its SHA256.
+- Otherwise, store only a download pointer (official source) + SHA256 in documentation.
+
 ---
 
 ## How to run the Web Bluetooth demo

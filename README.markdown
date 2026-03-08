@@ -77,6 +77,32 @@ In Wireshark you may also see the raw 16 bytes as:
 
 The sample app will try all of these representations during service discovery.
 
+## Vendor APK (MyVitals)
+
+The reverse engineering work in this repo references the Android app APK (e.g. “iHealth MyVitals 4.13.1”). That APK is a large binary and usually proprietary.
+
+- This repo does **not** commit the APK into git (GitHub blocks files >100MB, and committing third‑party binaries is often not appropriate).
+- If you are allowed to redistribute the APK to your collaborators, publish it as a **GitHub Release asset** instead of committing it.
+
+**Recommended workflow (Release assets + checksum)**
+
+1. Keep the APK out of git (it’s listed in `.gitignore`).
+2. Create a GitHub Release (tag like `vendor-myvitals-4.13.1`).
+3. Upload the APK as a Release asset.
+4. Record the SHA256 in the release notes so others can verify they downloaded the exact same binary.
+
+To compute SHA256 locally:
+
+```sh
+shasum -a 256 "iHealth MyVitals_4.13.1_APKPure.apk"
+```
+
+If you do **not** have redistribution rights, the safe alternative is to store only:
+
+- the app version string,
+- where to obtain it (official source), and
+- the SHA256 hash for verification.
+
 The app filters by that service, then enumerates characteristics under it and
 auto-selects the characteristic that emits frames beginning with `A0 11 F0`.
 
