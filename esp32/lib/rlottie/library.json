@@ -1,0 +1,20 @@
+{
+  "name": "rlottie",
+  "version": "0.0.0+vendored",
+  "description": "Vendored RLottie for ESP32; filters out non-Xtensa sources.",
+  "headers": "rlottie.h",
+  "build": {
+    "includeDir": "inc",
+    "flags": [
+      "-Isrc",
+      "-Isrc/vector",
+      "-Isrc/vector/freetype",
+      "-std=gnu++17"
+    ],
+    "srcFilter": [
+      "+<*>",
+      "-<vector/pixman/pixman-arm-neon-asm.S>",
+      "-<wasm/*>"
+    ]
+  }
+}
