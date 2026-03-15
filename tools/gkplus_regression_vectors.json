@@ -1,0 +1,92 @@
+[
+  {
+    "id": "2026-03-14-0915-general",
+    "tag": "GENERAL",
+    "glu9": "1a030e090f00490a11",
+    "ket9": "1a030e090f00200b55",
+    "expected": {
+      "when_local": "2026-03-14 09:15",
+      "glucose_mgdl": 73,
+      "ketone_mmol_l_1dp": 0.3,
+      "gki_1dp": 13.5
+    },
+    "official": {
+      "glucose": 73,
+      "ketone": 0.3,
+      "gki": 13.5,
+      "time_text": "9:15 20260313"
+    }
+  },
+  {
+    "id": "2026-03-12-0911-general",
+    "tag": "GENERAL",
+    "glu9": "1a030c090b01051a11",
+    "ket9": "1a030c090b01250b55",
+    "expected": {
+      "when_local": "2026-03-12 09:11",
+      "glucose_mgdl": 105,
+      "ketone_mmol_l_1dp": 1.4,
+      "gki_1dp": 4.1
+    },
+    "official": {
+      "glucose": 105,
+      "ketone": 1.4,
+      "gki": 4.1,
+      "time_text": "9:11 20260312"
+    }
+  },
+  {
+    "id": "2026-03-10-0845-general",
+    "tag": "GENERAL",
+    "glu9": "1a030a082d01041a11",
+    "ket9": "1a030a082d01160b55",
+    "expected": {
+      "when_local": "2026-03-10 08:45",
+      "glucose_mgdl": 104,
+      "ketone_mmol_l_1dp": 1.2,
+      "gki_1dp": 4.8
+    },
+    "official": {
+      "glucose": 104,
+      "ketone": 1.2,
+      "gki": 4.8,
+      "time_text": "8:45 20260310"
+    }
+  },
+  {
+    "id": "2026-03-08-0824-general",
+    "tag": "GENERAL",
+    "glu9": "1a0308081800581a11",
+    "ket9": "1a03080818001a0b55",
+    "expected": {
+      "when_local": "2026-03-08 08:24",
+      "glucose_mgdl": 88,
+      "ketone_mmol_l_1dp": 0.3,
+      "gki_1dp": 16.2
+    },
+    "official": {
+      "glucose": 88,
+      "ketone": 0.3,
+      "gki": 16.2,
+      "time_text": "8:24 20260308"
+    }
+  },
+  {
+    "id": "2026-03-07-0846-general",
+    "tag": "GENERAL",
+    "glu9": "1a0307082e00571a11",
+    "ket9": "1a0307082e002a0b55",
+    "expected": {
+      "when_local": "2026-03-07 08:46",
+      "glucose_mgdl": 87,
+      "ketone_mmol_l_1dp": 0.4,
+      "gki_1dp": 12.0
+    },
+    "official": {
+      "glucose": 87,
+      "ketone": 0.4,
+      "gki": 12.0,
+      "time_text": "8:46 20260307"
+    }
+  }
+]

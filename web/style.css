@@ -49,6 +49,34 @@ body {
   align-items: center;
 }
 
+.row-between {
+  justify-content: space-between;
+}
+
+.row-group {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+}
+
+.input {
+  appearance: none;
+  border: 1px solid #e5e7eb;
+  background: #ffffff;
+  color: #111827;
+  padding: 10px 12px;
+  border-radius: 8px;
+}
+
+.input:focus {
+  outline: none;
+  border-color: #111827;
+}
+
+.input-small {
+  width: 8ch;
+}
+
 .btn {
   appearance: none;
   border: 1px solid #111827;

@@ -4,6 +4,10 @@ This repo contains a working Web Bluetooth demo and a reverse-engineered BLE pro
 
 The device does **not** use the Bluetooth SIG Pulse Oximeter service (0x1822). It uses a vendor GATT service/characteristic and a proprietary packet protocol (short `A0 ..` notifications + `B0 ..` writes).
 
+## Sniffing (Wireshark)
+
+See [WIRESHARK_SNIFFING_README.markdown](WIRESHARK_SNIFFING_README.markdown) for a repeatable Wireshark + nRF Sniffer workflow and a starting advertising-only noise filter.
+
 ## Project goals
 
 - Connect from Chromium (Web Bluetooth)

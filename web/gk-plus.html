@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>BLE Health Hub — GK+ (Web Bluetooth)</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <main class="container">
+      <header class="header">
+        <h1>GK+ (Web Bluetooth)</h1>
+        <p class="subtle">
+          Connects to the GK+ vendor service and decodes the framed
+          <span class="mono">0x7b … 0x7d</span> messages.
+          <a href="./index.html">Pulse Ox page</a>
+        </p>
+      </header>
+
+      <section class="card">
+        <div class="row row-between">
+          <div class="row-group">
+            <button id="connectBtn" class="btn">Connect</button>
+            <button id="disconnectBtn" class="btn btn-secondary" disabled>
+              Disconnect
+            </button>
+          </div>
+
+          <div class="row-group">
+            <label class="label" for="recordsToFetch">Records to fetch</label>
+            <input
+              id="recordsToFetch"
+              type="number"
+              min="1"
+              max="1000"
+              step="1"
+              value="1"
+              class="input input-small mono"
+            />
+            <button id="fetchBtn" class="btn btn-secondary" type="button" disabled>
+              Fetch
+            </button>
+          </div>
+        </div>
+
+        <div class="grid">
+          <div>
+            <div class="label">Status</div>
+            <div id="status" class="mono">Idle</div>
+          </div>
+          <div>
+            <div class="label">Set Time (decoded)</div>
+            <div id="setTime" class="mono">—</div>
+          </div>
+          <div>
+            <div class="label">Device</div>
+            <div id="device" class="mono">—</div>
+          </div>
+          <div>
+            <div class="label">Service UUID</div>
+            <div id="serviceUuid" class="mono">—</div>
+          </div>
+          <div>
+            <div class="label">Notify / Write Characteristics</div>
+            <div id="chars" class="mono">—</div>
+          </div>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="values">
+          <div class="value">
+            <div class="label">Glucose</div>
+            <div id="glucose" class="big">—</div>
+          </div>
+          <div class="value">
+            <div class="label">Blood Ketone</div>
+            <div id="ketone" class="big">—</div>
+          </div>
+          <div class="value">
+            <div class="label">GKI</div>
+            <div id="gki" class="big">—</div>
+          </div>
+        </div>
+
+        <div class="grid">
+          <div>
+            <div class="label">Meal Tag</div>
+            <div id="mealTag" class="mono">
+              <span id="mealIcon" aria-hidden="true">—</span>
+              <span id="mealText">—</span>
+            </div>
+          </div>
+          <div>
+            <div class="label">Records Count (0xdb)</div>
+            <div id="recordId" class="mono">—</div>
+          </div>
+          <div class="span2">
+            <div class="label">Last RX payload (hex)</div>
+            <div id="lastRx" class="mono">—</div>
+          </div>
+        </div>
+
+        <p class="subtle small">
+          Notes: Web Bluetooth works in Chromium browsers (Chrome/Edge) on a
+          secure context (HTTPS or <span class="mono">http://localhost</span>).
+        </p>
+      </section>
+
+      <section class="card">
+        <details>
+          <summary>Debug log</summary>
+          <div class="row log-actions">
+            <button id="copyLogBtn" class="btn btn-secondary" type="button">
+              Copy log
+            </button>
+            <button id="copySampleBtn" class="btn btn-secondary" type="button">
+              Copy sample + log
+            </button>
+            <button id="copyReadingsBtn" class="btn btn-secondary" type="button">
+              Copy readings table
+            </button>
+          </div>
+          <pre id="log" class="log" aria-live="polite"></pre>
+        </details>
+      </section>
+    </main>
+
+    <script type="module" src="./gk-plus.js?v=35"></script>
+  </body>
+</html>

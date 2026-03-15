@@ -5,7 +5,7 @@ Reverse-engineering notes and tooling for BLE health devices.
 ## Device docs
 
 - Pulse oximeter (PO3): [PULSE_OX_README.markdown](PULSE_OX_README.markdown)
-- GK+ (not reverse engineered yet): [GK+_README.markdown](GK+_README.markdown)
+- GK+ (reverse engineering notes): [GK+_README.markdown](GK+_README.markdown)
 
 ## Key files
 

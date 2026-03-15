@@ -1,9 +1,24 @@
 # Large vendor APK (exceeds GitHub 100MB limit)
 vendor/ihealth/*.apk
 
+# Keto-Mojo APKs (keep local; publish via GitHub Releases if needed)
+vendor/keto-mojo/*.apk
+
 # macOS metadata
 .DS_Store
 **/.DS_Store
 
 # Local scratch space (ignored)
 tmp/
+
+# Local reverse-engineering scratch (ignored)
+.tmp_native/
+.tmp_apk_extract/
+
+# Python caches / local env
+**/__pycache__/
+*.pyc
+.venv/
+
+# VS Code workspace settings
+.vscode/
