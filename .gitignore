@@ -25,3 +25,9 @@ tmp/
 
 # PlatformIO build artifacts
 .pio/
+
+# ESP32 build-time generated sources
+esp32/src/generated/
+
+# ESP32 generated sources
+esp32/src/generated/

@@ -4,7 +4,7 @@ Goal: a standalone ESP32 app that shows GK+ + pulse-ox values on a **76x284 TFT*
 
 ## Status
 
-- Current milestone: **display bring-up** (draw a sample dashboard + blinking status dot)
+- Current milestone: **display bring-up + animation** (full-screen Lottie playback)
 - BLE is not wired up yet.
 
 ## Prereqs
@@ -28,6 +28,41 @@ If `pio` is not on your PATH, use the default PlatformIO venv install path:
 ```sh
 ~/.platformio/penv/bin/pio run -e esp32-s3-n16r8
 ```
+
+## Lottie animation (RLottie)
+
+We play a full-screen (76x284) Lottie animation using **RLottie**.
+
+### Asset location
+
+- Put the dotLottie file at: `esp32/assets/flame.lottie`
+
+### Build-time JSON extraction
+
+`.lottie` is a zip container. We extract the first animation JSON during the PlatformIO build and generate a header:
+
+- Script: `esp32/scripts/gen_flame_lottie_header.py`
+- Output (generated): `esp32/src/generated/flame_lottie.h`
+
+The generated directory is ignored in git (it is recreated during build).
+
+### Vendored RLottie
+
+RLottie is vendored under:
+
+- `esp32/lib/rlottie`
+
+This lets us control compilation for ESP32 (Xtensa):
+
+- Force a modern C++ standard for RLottie sources via `esp32/lib/rlottie/library.json` (`-std=gnu++17`)
+- Exclude non-ESP32 sources (e.g. `wasm/*`, ARM NEON assembly)
+- Avoid `<dlfcn.h>` by compiling the non-plugin image loader path
+
+### Runtime rendering strategy
+
+- Render frames to an ARGB8888 buffer (prefer PSRAM)
+- Convert to RGB565
+- Push the full 76x284 frame via TFT_eSPI each tick
 
 ## Display configuration
 

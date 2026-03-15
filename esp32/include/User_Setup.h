@@ -20,6 +20,7 @@
 #define USE_FSPI_PORT
 
 // Some ST7789 panels have different offsets; adjust if your image is shifted.
+// If your reds/blues look swapped, enable BGR order:
 // #define TFT_RGB_ORDER TFT_BGR
 
 // ---- SPI mode ----
