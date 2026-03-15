@@ -22,3 +22,6 @@ tmp/
 
 # VS Code workspace settings
 .vscode/
+
+# PlatformIO build artifacts
+.pio/
