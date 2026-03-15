@@ -305,6 +305,65 @@ static uint32_t gLastLottieInitAttemptMs = 0;
 static TaskHandle_t gRenderTask = nullptr;
 static bool gOverlayDirty = true;
 
+// Offscreen overlay sprite (used only during reveal animation to avoid visible
+// "clear then redraw" flicker).
+static TFT_eSprite gOverlaySprite = TFT_eSprite(&tft);
+static bool gOverlaySpriteOk = false;
+static void initOverlaySpriteOnce() {
+  if (gOverlaySpriteOk) return;
+  gOverlaySprite.setColorDepth(16);
+  // createSprite() returns nullptr on failure.
+  gOverlaySpriteOk = (gOverlaySprite.createSprite(kPanelW, kOverlayH) != nullptr);
+  if (gOverlaySpriteOk) {
+    gOverlaySprite.fillSprite(TFT_BLACK);
+  }
+}
+
+// Post-reveal "juice": expand ketosis label background to full-screen.
+// Sequence: expand (0.5s) -> hold (2s) -> contract (0.5s) -> done.
+static TFT_eSprite gPanelFxSprite = TFT_eSprite(&tft);
+static bool gPanelFxSpriteOk = false;
+static void initPanelFxSpriteOnce() {
+  if (gPanelFxSpriteOk) return;
+  gPanelFxSprite.setColorDepth(16);
+  gPanelFxSpriteOk = (gPanelFxSprite.createSprite(kPanelW, kPanelH) != nullptr);
+  if (gPanelFxSpriteOk) {
+    gPanelFxSprite.fillSprite(TFT_BLACK);
+  }
+}
+
+enum LabelFxState {
+  kLabelFxNone = 0,
+  kLabelFxExpand = 1,
+  kLabelFxHold = 2,
+};
+
+static volatile uint8_t gLabelFxState = kLabelFxNone;
+static volatile uint32_t gLabelFxPhaseStartMs = 0;
+
+static inline bool isLabelFxActive() {
+  return gLabelFxState != kLabelFxNone;
+}
+
+static void startLabelFxIfPossible() {
+  if (gKetosisLabel.length() == 0) return;
+  if (isLabelFxActive()) return;
+  gLabelFxState = kLabelFxExpand;
+  gLabelFxPhaseStartMs = millis();
+  gOverlayDirty = true;
+}
+
+// Overlay reveal animation (slide in from left) when real readings arrive.
+static volatile bool gOverlayRevealActive = false;
+static volatile uint32_t gOverlayRevealStartMs = 0;
+static void startOverlayReveal() {
+  gOverlayRevealStartMs = millis();
+  gOverlayRevealActive = true;
+  gLabelFxState = kLabelFxNone;
+  gOverlayDirty = true;
+  gStatusStripDirty = true;
+}
+
 static void setBleConnected(bool v) {
   if (gBleConnected == v) return;
   gBleConnected = v;
@@ -850,6 +909,10 @@ static void gkplusTask(void* /*param*/) {
           portEXIT_CRITICAL(&gUiMux);
 
           requestUiStep(stage);
+          // Give the UI a bit of life: slide values in once we have real data.
+          if (!kDemoMode) {
+            startOverlayReveal();
+          }
           sess->gotReading = true;
         }
       }
@@ -1119,8 +1182,101 @@ static void drawOverlay() {
   applyPanelViewport();
   tft.setTextDatum(TL_DATUM);
   tft.setTextSize(1);
+
+  // Full-screen label FX (runs after the slide-in completes).
+  if (!gShowLoading && !gShowNoWifi && isLabelFxActive() && (gKetosisLabel.length() > 0)) {
+    initPanelFxSpriteOnce();
+    const uint32_t now = millis();
+    static constexpr uint32_t kExpandMs = 140;
+    static constexpr uint32_t kHoldMs = 1000;
+
+    uint8_t state = gLabelFxState;
+    uint32_t phaseStart = gLabelFxPhaseStartMs;
+
+    // Advance phases.
+    if (state == kLabelFxExpand && (now - phaseStart) >= kExpandMs) {
+      state = kLabelFxHold;
+      phaseStart = now;
+      gLabelFxState = state;
+      gLabelFxPhaseStartMs = phaseStart;
+    } else if (state == kLabelFxHold && (now - phaseStart) >= kHoldMs) {
+      gLabelFxState = kLabelFxNone;
+      gOverlayDirty = true;
+      gStatusStripDirty = true;
+      // Snap back to normal bar: fall through and draw the regular overlay.
+      state = kLabelFxNone;
+    }
+
+    // Compute vertical extent.
+    const int barH = 16;
+    const int barY = kOverlayH - barH;
+    const float centerY = (float)barY + ((float)barH * 0.5f);
+
+    // Keep label text pinned to its normal position (does not move during FX).
+    const int labelCy = barY + (barH / 2);
+
+    float p = 0.0f;
+    if (state == kLabelFxExpand) {
+      p = (float)(now - phaseStart) / (float)kExpandMs;
+      p = max(0.0f, min(1.0f, p));
+      // Ease-in so it feels like it accelerates.
+      p = p * p * p;
+    } else if (state == kLabelFxHold) {
+      p = 1.0f;
+    } else {
+      // Snapped back.
+      p = 0.0f;
+    }
+    const int h = (int)lroundf(((float)barH) + (((float)kPanelH - (float)barH) * p));
+    int y0 = (int)lroundf(centerY - ((float)h * 0.5f));
+    int y1 = y0 + h;
+    if (y0 < 0) {
+      y1 -= y0;
+      y0 = 0;
+    }
+    if (y1 > kPanelH) {
+      const int overflow = y1 - kPanelH;
+      y0 -= overflow;
+      y1 = kPanelH;
+      if (y0 < 0) y0 = 0;
+    }
+
+    if (gPanelFxSpriteOk) {
+      gPanelFxSprite.fillSprite(TFT_BLACK);
+      gPanelFxSprite.fillRect(0, y0, kPanelW, max(0, y1 - y0), gKetosisLabelBg);
+
+      gPanelFxSprite.setTextSize(1);
+      gPanelFxSprite.setTextColor(gKetosisLabelFg, gKetosisLabelBg);
+      gPanelFxSprite.setTextDatum(MC_DATUM);
+      gPanelFxSprite.drawString(gKetosisLabel, kPanelW / 2, labelCy);
+      gPanelFxSprite.setTextDatum(TL_DATUM);
+
+      gPanelFxSprite.pushSprite(0, 0);
+    } else {
+      // Fallback (no sprite): draw directly.
+      tft.fillRect(0, 0, kPanelW, kPanelH, TFT_BLACK);
+      tft.fillRect(0, y0, kPanelW, max(0, y1 - y0), gKetosisLabelBg);
+      tft.setTextSize(1);
+      tft.setTextColor(gKetosisLabelFg, gKetosisLabelBg);
+      tft.setTextDatum(MC_DATUM);
+      tft.drawString(gKetosisLabel, kPanelW / 2, labelCy);
+      tft.setTextDatum(TL_DATUM);
+    }
+
+    // Keep animating smoothly.
+    if (state != kLabelFxNone) {
+      gOverlayDirty = true;
+      return;
+    }
+  }
+
+  // If we're revealing, prefer an offscreen sprite to avoid visible partial
+  // redraw flicker.
+  const bool willUseSprite = (!gShowLoading && gOverlayRevealActive && gOverlaySpriteOk);
   if (!gShowLoading) {
-    tft.fillRect(0, 0, kPanelW, kOverlayH, TFT_BLACK);
+    if (!willUseSprite) {
+      tft.fillRect(0, 0, kPanelW, kOverlayH, TFT_BLACK);
+    }
 
     // Ensure the area below the overlay starts black at least once.
     static bool clearedAnimArea = false;
@@ -1137,43 +1293,156 @@ static void drawOverlay() {
 
   const float gki = getDisplayedGki();
 
-  // Label + big number, three stacked blocks.
-  auto drawMetric = [&](int y, const char* label, const String& value) {
+  const bool reveal = (!gShowLoading && gOverlayRevealActive);
+  const uint32_t revealT = reveal ? (millis() - (uint32_t)gOverlayRevealStartMs) : 0;
+  // Three groups: GLU, then KET, then (GKI + ketosis label).
+  static constexpr uint32_t kRevealDurMs = 180;
+  static constexpr uint32_t kRevealGapMs = 80;
+  const uint32_t dGlu = 0;
+  const uint32_t dKet = dGlu + kRevealDurMs + kRevealGapMs;
+  const uint32_t dGki = dKet + kRevealDurMs + kRevealGapMs;
+
+  auto easeOutBack01 = [&](float p) -> float {
+    // Ease-out with a small overshoot ("bounce") at the end.
+    // p in [0..1] -> returns roughly [0..1].
+    const float c1 = 1.35f;
+    const float c3 = c1 + 1.0f;
+    const float x = p - 1.0f;
+    return 1.0f + c3 * x * x * x + c1 * x * x;
+  };
+
+  auto slideX = [&](uint32_t delayMs) -> int {
+    if (!reveal) return 0;
+    if (revealT <= delayMs) return -kPanelW;
+    const uint32_t t = revealT - delayMs;
+    if (t >= kRevealDurMs) return 0;
+    float p = (float)t / (float)kRevealDurMs;
+    p = max(0.0f, min(1.0f, p));
+    const float e = easeOutBack01(p);
+    // Start at -W, end at 0, with small overshoot.
+    const float x = (-((float)kPanelW)) * (1.0f - e);
+    // Clamp overshoot so text doesn't fly too far.
+    return (int)lroundf(max(-((float)kPanelW), min(8.0f, x)));
+  };
+
+  // When revealing, render the full overlay into an offscreen sprite and push
+  // it in one go (prevents visible partial redraw flicker).
+  const bool useSprite = (reveal && gOverlaySpriteOk);
+
+  auto drawMetricTft = [&](int y, int x, const char* label, const String& value) {
     y += kOverlayTextPadTopPx;
     tft.setTextSize(1);
     tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-    tft.drawString(label, 2, y);
+    tft.drawString(label, x, y);
 
     tft.setTextSize(2);
     tft.setTextColor(TFT_WHITE, TFT_BLACK);
     tft.setTextDatum(TL_DATUM);
-    tft.drawString(value, 2, y + 14);
+    tft.drawString(value, x, y + 14);
   };
 
+  auto drawMetricSprite = [&](int y, int x, const char* label, const String& value) {
+    y += kOverlayTextPadTopPx;
+    gOverlaySprite.setTextSize(1);
+    gOverlaySprite.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+    gOverlaySprite.drawString(label, x, y);
+
+    gOverlaySprite.setTextSize(2);
+    gOverlaySprite.setTextColor(TFT_WHITE, TFT_BLACK);
+    gOverlaySprite.setTextDatum(TL_DATUM);
+    gOverlaySprite.drawString(value, x, y + 14);
+  };
+
+  if (useSprite) {
+    gOverlaySprite.setTextDatum(TL_DATUM);
+    gOverlaySprite.setTextSize(1);
+    gOverlaySprite.fillSprite(TFT_BLACK);
+  }
+
   if (!gShowLoading) {
-    drawMetric(2, "GLU", String(gGluMgDl, 0));
-    drawMetric(58, "KET", String(gKetMmolL, 1));
-    drawMetric(114, "GKI", String(gki, 1));
+    const int xGlu = 2 + slideX(dGlu);
+    const int xKet = 2 + slideX(dKet);
+    const int xGki = 2 + slideX(dGki);
+
+    if (!reveal || revealT >= dGlu) {
+      if (useSprite) {
+        drawMetricSprite(2, xGlu, "GLU", String(gGluMgDl, 0));
+      } else {
+        drawMetricTft(2, xGlu, "GLU", String(gGluMgDl, 0));
+      }
+    }
+    if (!reveal || revealT >= dKet) {
+      if (useSprite) {
+        drawMetricSprite(58, xKet, "KET", String(gKetMmolL, 1));
+      } else {
+        drawMetricTft(58, xKet, "KET", String(gKetMmolL, 1));
+      }
+    }
+    if (!reveal || revealT >= dGki) {
+      if (useSprite) {
+        drawMetricSprite(114, xGki, "GKI", String(gki, 1));
+      } else {
+        drawMetricTft(114, xGki, "GKI", String(gki, 1));
+      }
+    }
   }
 
   if (gTopStatus.length() > 0) {
-    tft.setTextSize(1);
-    tft.setTextColor(TFT_WHITE, TFT_BLACK);
-    tft.setTextDatum(TC_DATUM);
-    tft.drawString(gTopStatus, kPanelW / 2, 2 + kOverlayTextPadTopPx);
-    tft.setTextDatum(TL_DATUM);
+    if (useSprite) {
+      gOverlaySprite.setTextSize(1);
+      gOverlaySprite.setTextColor(TFT_WHITE, TFT_BLACK);
+      gOverlaySprite.setTextDatum(TC_DATUM);
+      gOverlaySprite.drawString(gTopStatus, kPanelW / 2, 2 + kOverlayTextPadTopPx);
+      gOverlaySprite.setTextDatum(TL_DATUM);
+    } else {
+      tft.setTextSize(1);
+      tft.setTextColor(TFT_WHITE, TFT_BLACK);
+      tft.setTextDatum(TC_DATUM);
+      tft.drawString(gTopStatus, kPanelW / 2, 2 + kOverlayTextPadTopPx);
+      tft.setTextDatum(TL_DATUM);
+    }
   }
 
   // Ketosis label bar: full width background rectangle.
   if (gKetosisLabel.length() > 0) {
     const int barH = 16;
     const int barY = kOverlayH - barH;
-    tft.fillRect(0, barY, kPanelW, barH, gKetosisLabelBg);
-    tft.setTextSize(1);
-    tft.setTextColor(gKetosisLabelFg, gKetosisLabelBg);
-    tft.setTextDatum(MC_DATUM);
-    tft.drawString(gKetosisLabel, kPanelW / 2, barY + (barH / 2));
-    tft.setTextDatum(TL_DATUM);
+    if (!reveal || revealT >= dGki) {
+      const int xBar = slideX(dGki);
+      const int l = max(0, xBar);
+      const int r = min(kPanelW, xBar + kPanelW);
+      if (r > l) {
+        if (useSprite) {
+          gOverlaySprite.fillRect(l, barY, r - l, barH, gKetosisLabelBg);
+        } else {
+          tft.fillRect(l, barY, r - l, barH, gKetosisLabelBg);
+        }
+      }
+      if (useSprite) {
+        gOverlaySprite.setTextSize(1);
+        gOverlaySprite.setTextColor(gKetosisLabelFg, gKetosisLabelBg);
+        gOverlaySprite.setTextDatum(MC_DATUM);
+        gOverlaySprite.drawString(gKetosisLabel, (kPanelW / 2) + xBar, barY + (barH / 2));
+        gOverlaySprite.setTextDatum(TL_DATUM);
+      } else {
+        tft.setTextSize(1);
+        tft.setTextColor(gKetosisLabelFg, gKetosisLabelBg);
+        tft.setTextDatum(MC_DATUM);
+        tft.drawString(gKetosisLabel, (kPanelW / 2) + xBar, barY + (barH / 2));
+        tft.setTextDatum(TL_DATUM);
+      }
+    }
+  }
+
+  if (useSprite) {
+    // Push the overlay sprite into the panel viewport.
+    gOverlaySprite.pushSprite(0, 0);
+  }
+
+  if (reveal && revealT >= (dGki + kRevealDurMs + 5)) {
+    gOverlayRevealActive = false;
+    startLabelFxIfPossible();
+    gOverlayDirty = true;
   }
 
   drawStatusDots();
@@ -1401,6 +1670,7 @@ static void applyUiStepVisual(int step) {
   // so RLottie setValue() calls are serialized.
   gShowLoading = false;
   gShowNoWifi = false;
+  gLabelFxState = kLabelFxNone;
 
   switch (step) {
     case 0: {
@@ -1540,6 +1810,12 @@ static void applyDemoStep(int step) {
   }
 
   applyUiStepVisual(step);
+
+  // Give demo stages some life too: slide values in for ketosis stages.
+  // (Loading has no metrics; NO WIFI is a separate full-screen layout.)
+  if (step == 0 || step == 1 || step == 2 || step == 3) {
+    startOverlayReveal();
+  }
 }
 
 static void renderTask(void* /*param*/) {
@@ -1568,7 +1844,8 @@ static void renderTask(void* /*param*/) {
           gDemoStartMs = now;
         }
         static constexpr int kDemoSteps = 6;
-        static constexpr int kDemoOrder[kDemoSteps] = {4, 5, 0, 1, 2, 3};
+        // Demo cycle: Loading -> Not -> Low -> Mid -> High -> WiFi
+        static constexpr int kDemoOrder[kDemoSteps] = {4, 0, 1, 2, 3, 5};
         const int idx = (int)(((now - gDemoStartMs) / kDemoStepMs) % kDemoSteps);
         const int nextStep = (gForceNoWifiScreen ? 5 : kDemoOrder[idx]);
         if (nextStep != appliedStep) {
@@ -1710,6 +1987,8 @@ static void renderAndPushLottieFrame() {
     }
   }
 
+  const bool labelFxActive = isLabelFxActive();
+
   // Push to display.
   int x = 0;
   int y = 0;
@@ -1721,7 +2000,7 @@ static void renderAndPushLottieFrame() {
   const int animY0 = gShowLoading ? kLoadingStatusH : max(0, min(kOverlayH, kPanelH));
   // Also reserve a bottom status strip for time + dots.
   const int animH = max(0, (kPanelH - kBottomStatusH) - animY0);
-  if (animH > 0) {
+  if (!labelFxActive && animH > 0) {
     tft.setSwapBytes(kSwapBytesForPushImage);
     tft.startWrite();
     tft.pushImage(x, y + animY0, kPanelW, animH, gFrame565 + (size_t)animY0 * (size_t)kPanelW);
@@ -1729,13 +2008,17 @@ static void renderAndPushLottieFrame() {
   }
 
   // Refresh overlay only when needed (avoids a visible periodic "blip").
-  if (gOverlayDirty) {
+  if (gOverlayDirty || gOverlayRevealActive || labelFxActive) {
     gOverlayDirty = false;
     drawOverlay();
   }
 
-  // Always draw the Wi-Fi status dot last so it stays visible on top.
-  drawStatusDots();
+  // During the full-screen label FX, don't draw the bottom status strip,
+  // otherwise it won't truly fill the screen.
+  if (!labelFxActive) {
+    // Always draw the Wi-Fi status dot last so it stays visible on top.
+    drawStatusDots();
+  }
 }
 
 static void setBacklight(bool on) {
@@ -1862,6 +2145,8 @@ void setup() {
   // If blacks look white ("negative" image), this is the fix.
   tft.invertDisplay(kInvertDisplay);
   applyPanelViewport();
+
+  initOverlaySpriteOnce();
 
   // Post-init sanity fill: keep it black (avoid white background flashes).
   Serial.println("post-init: fill black");
