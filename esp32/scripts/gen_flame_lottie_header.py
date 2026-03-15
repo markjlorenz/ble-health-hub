@@ -40,6 +40,32 @@ def _pick_animation_json_path(manifest: dict, zip_names: list[str]) -> str:
 
 
 def _emit_header(json_bytes: bytes, out_path: str) -> None:
+    anim = json.loads(json_bytes.decode("utf-8"))
+    markers = anim.get("markers")
+    if not isinstance(markers, list):
+        markers = []
+
+    def _find_marker(name: str) -> tuple[bool, int, int]:
+        for m in markers:
+            if not isinstance(m, dict):
+                continue
+            cm = m.get("cm")
+            if cm != name:
+                continue
+            tm = m.get("tm")
+            dr = m.get("dr")
+            if not isinstance(tm, (int, float)) or not isinstance(dr, (int, float)):
+                return (False, 0, 0)
+            start = int(round(tm))
+            count = int(round(dr))
+            if count < 0:
+                count = 0
+            return (True, start, count)
+        return (False, 0, 0)
+
+    has_flame, flame_start, flame_count = _find_marker("Flame Burn")
+    has_load, load_start, load_count = _find_marker("Log Loading")
+
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     # Emit as a byte array to avoid escaping issues.
     # The JSON is UTF-8; most tools produce ASCII-only, but we don't assume.
@@ -59,6 +85,15 @@ def _emit_header(json_bytes: bytes, out_path: str) -> None:
         f.write(arr)
         f.write("\n};\n")
         f.write("static constexpr std::size_t kFlameLottieJsonSize = sizeof(kFlameLottieJsonBytes);\n")
+        f.write("\n")
+        f.write("// Marker segments extracted from the animation JSON.\n")
+        f.write("// In Bodymovin/Lottie JSON, marker time (tm) and duration (dr) are in frame units.\n")
+        f.write(f"static constexpr bool kHasMarkerFlameBurn = {str(has_flame).lower()};\n")
+        f.write(f"static constexpr int kMarkerFlameBurnStartFrame = {flame_start};\n")
+        f.write(f"static constexpr int kMarkerFlameBurnFrameCount = {flame_count};\n")
+        f.write(f"static constexpr bool kHasMarkerLogLoading = {str(has_load).lower()};\n")
+        f.write(f"static constexpr int kMarkerLogLoadingStartFrame = {load_start};\n")
+        f.write(f"static constexpr int kMarkerLogLoadingFrameCount = {load_count};\n")
         f.write("}  // namespace assets\n")
 
 

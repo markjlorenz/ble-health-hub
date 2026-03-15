@@ -57,6 +57,11 @@ static constexpr int kPanelYOff = 18;
 
 // Reserve a small header for static UI text so the animation doesn't overwrite it.
 static constexpr int kOverlayH = 170;
+static constexpr int kOverlayTextPadTopPx = 4;
+// In the LOADING stage we want the logs to fall from near the top, but we still
+// need a stable place for the "LOADING" label that doesn't get overwritten by
+// the animation every frame (which causes visible flashing).
+static constexpr int kLoadingStatusH = 16;
 
 static float gGluMgDl = 110.0f;
 static float gKetMmolL = 1.2f;
@@ -181,9 +186,53 @@ static uint32_t gLastLottieInitAttemptMs = 0;
 static TaskHandle_t gRenderTask = nullptr;
 static bool gOverlayDirty = true;
 
+static bool gShowLoading = false;
+static String gTopStatus = "";
+
+static uint32_t gDemoStartMs = 0;
+
+static size_t gLoopStartFrame = 0;
+static size_t gLoopFrameCount = 0;
+
 static std::vector<std::string> gLayerNames;
 
 static constexpr size_t kLottieLoopFrames = 26;
+
+static void setLoopSegmentFrames(size_t startFrame, size_t frameCount) {
+  gLoopStartFrame = startFrame;
+  gLoopFrameCount = frameCount;
+  gAnimStartMs = millis();
+}
+
+static void setLoopToFlameBurn() {
+  if (!gAnim) return;
+  const size_t total = max<size_t>(1, gAnimTotalFrames);
+  if (assets::kHasMarkerFlameBurn && assets::kMarkerFlameBurnFrameCount > 0) {
+    const size_t start = (size_t)max(0, assets::kMarkerFlameBurnStartFrame);
+    const size_t count = (size_t)max(0, assets::kMarkerFlameBurnFrameCount);
+    if (start < total && count > 0) {
+      setLoopSegmentFrames(start, min(count, total - start));
+      return;
+    }
+  }
+  const size_t fallback = (size_t)max<size_t>(1, min(kLottieLoopFrames, total));
+  setLoopSegmentFrames(0, fallback);
+}
+
+static void setLoopToLogLoading() {
+  if (!gAnim) return;
+  const size_t total = max<size_t>(1, gAnimTotalFrames);
+  if (assets::kHasMarkerLogLoading && assets::kMarkerLogLoadingFrameCount > 0) {
+    const size_t start = (size_t)max(0, assets::kMarkerLogLoadingStartFrame);
+    const size_t count = (size_t)max(0, assets::kMarkerLogLoadingFrameCount);
+    if (start < total && count > 0) {
+      setLoopSegmentFrames(start, min(count, total - start));
+      return;
+    }
+  }
+  const size_t fallback = (size_t)max<size_t>(1, min((size_t)19, total));
+  setLoopSegmentFrames(0, fallback);
+}
 
 static void drawOverlay() {
   // Keep it simple and legible: opaque black background.
@@ -191,21 +240,27 @@ static void drawOverlay() {
   applyPanelViewport();
   tft.setTextDatum(TL_DATUM);
   tft.setTextSize(1);
-  tft.fillRect(0, 0, kPanelW, kOverlayH, TFT_BLACK);
+  if (!gShowLoading) {
+    tft.fillRect(0, 0, kPanelW, kOverlayH, TFT_BLACK);
 
-  // Ensure the area below the overlay starts black at least once.
-  static bool clearedAnimArea = false;
-  if (!clearedAnimArea) {
-    clearedAnimArea = true;
-    if (kPanelH > kOverlayH) {
-      tft.fillRect(0, kOverlayH, kPanelW, kPanelH - kOverlayH, TFT_BLACK);
+    // Ensure the area below the overlay starts black at least once.
+    static bool clearedAnimArea = false;
+    if (!clearedAnimArea) {
+      clearedAnimArea = true;
+      if (kPanelH > kOverlayH) {
+        tft.fillRect(0, kOverlayH, kPanelW, kPanelH - kOverlayH, TFT_BLACK);
+      }
     }
+  } else {
+    // LOADING: only clear a thin status strip; let the animation occupy the rest.
+    tft.fillRect(0, 0, kPanelW, kLoadingStatusH, TFT_BLACK);
   }
 
   const float gki = getDisplayedGki();
 
   // Label + big number, three stacked blocks.
   auto drawMetric = [&](int y, const char* label, const String& value) {
+    y += kOverlayTextPadTopPx;
     tft.setTextSize(1);
     tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
     tft.drawString(label, 2, y);
@@ -216,9 +271,19 @@ static void drawOverlay() {
     tft.drawString(value, 2, y + 14);
   };
 
-  drawMetric(2, "GLU", String(gGluMgDl, 0));
-  drawMetric(58, "KET", String(gKetMmolL, 1));
-  drawMetric(114, "GKI", String(gki, 1));
+  if (!gShowLoading) {
+    drawMetric(2, "GLU", String(gGluMgDl, 0));
+    drawMetric(58, "KET", String(gKetMmolL, 1));
+    drawMetric(114, "GKI", String(gki, 1));
+  }
+
+  if (gTopStatus.length() > 0) {
+    tft.setTextSize(1);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.setTextDatum(TC_DATUM);
+    tft.drawString(gTopStatus, kPanelW / 2, 2 + kOverlayTextPadTopPx);
+    tft.setTextDatum(TL_DATUM);
+  }
 
   // Ketosis label bar: full width background rectangle.
   if (gKetosisLabel.length() > 0) {
@@ -391,6 +456,9 @@ static void initLottie() {
     const std::string& name = std::get<0>(info);
     if (!name.empty()) gLayerNames.push_back(name);
   }
+
+  // Default loop segment for demo mode.
+  setLoopToFlameBurn();
 }
 
 static void setLayerOpacityPct(const std::string& layerName, float opacityPct) {
@@ -448,6 +516,9 @@ static void setAllLayersOpacityPct(float opacityPct) {
 }
 
 static void applyDemoStep(int step) {
+  gShowLoading = false;
+  gTopStatus = "";
+
   // Step meanings per user spec.
   switch (step) {
     case 0: {
@@ -462,6 +533,8 @@ static void applyDemoStep(int step) {
       // Only Logs visible.
       setAllLayersOpacityPct(0.0f);
       setLayerOpacityPct("Logs", 100.0f);
+
+      setLoopToFlameBurn();
       break;
     }
     case 1: {
@@ -478,6 +551,8 @@ static void applyDemoStep(int step) {
       setLayerOpacityPct("Logs", 100.0f);
       setLayerOpacityPct("Orange Container", 100.0f);
       setLayerOpacityPct("Yellow Container", 100.0f);
+
+      setLoopToFlameBurn();
       break;
     }
     case 2: {
@@ -489,10 +564,12 @@ static void applyDemoStep(int step) {
       gKetosisLabelBg = gKetosisYellow565;
       gKetosisLabelFg = TFT_BLACK;
 
-      // All visible except BigRed Container and RedWhisp.
+      // All visible except BigRed Container and the red whisp element.
       setAllLayersOpacityPct(100.0f);
       setLayerOpacityPct("BigRed Container", 0.0f);
-      setLayerOpacityPct("RedWhips Outline Container", 0.0f);
+      setLayerOpacityPct("SideRed Container", 0.0f);
+
+      setLoopToFlameBurn();
       break;
     }
     case 3: {
@@ -506,6 +583,23 @@ static void applyDemoStep(int step) {
 
       // All layers visible.
       setAllLayersOpacityPct(100.0f);
+
+      setLoopToFlameBurn();
+      break;
+    }
+    case 4: {
+      // New stage: Log Loading
+      gShowLoading = true;
+      gTopStatus = "LOADING";
+      gKetosisLabel = "";
+      gKetosisLabelBg = TFT_BLACK;
+      gKetosisLabelFg = TFT_WHITE;
+
+      // Keep this stage simple: only Logs visible.
+      setAllLayersOpacityPct(0.0f);
+      setLayerOpacityPct("Logs", 100.0f);
+
+      setLoopToLogLoading();
       break;
     }
     default:
@@ -528,7 +622,13 @@ static void renderTask(void* /*param*/) {
     }
 
     if (kDemoMode && gLottieReady) {
-      const int nextStep = (int)((now / kDemoStepMs) % 4);
+      if (gDemoStartMs == 0) {
+        gDemoStartMs = now;
+      }
+      static constexpr int kDemoSteps = 5;
+      static constexpr int kDemoOrder[kDemoSteps] = {4, 0, 1, 2, 3};
+      const int idx = (int)(((now - gDemoStartMs) / kDemoStepMs) % kDemoSteps);
+      const int nextStep = kDemoOrder[idx];
       if (nextStep != demoStep) {
         demoStep = nextStep;
         Serial.printf("DEMO: step=%d\n", demoStep);
@@ -553,8 +653,10 @@ static void renderAndPushLottieFrame() {
   const uint32_t now = millis();
   const uint32_t elapsedMs = now - gAnimStartMs;
   const double frameF = (elapsedMs * gAnimFps) / 1000.0;
-  const size_t loopFrames = (size_t)max<size_t>(1, min(kLottieLoopFrames, gAnimTotalFrames));
-  const size_t frame = (size_t)((uint64_t)frameF % (uint64_t)loopFrames);
+  const size_t total = (size_t)max<size_t>(1, gAnimTotalFrames);
+  const size_t loopFrames = (size_t)max<size_t>(1, min((gLoopFrameCount > 0) ? gLoopFrameCount : kLottieLoopFrames, total));
+  const size_t base = (gLoopStartFrame < total) ? gLoopStartFrame : 0;
+  const size_t frame = base + (size_t)((uint64_t)frameF % (uint64_t)loopFrames);
 
   // Render into ARGB8888 (premultiplied).
   // Clear to black first; RLottie doesn't necessarily overwrite every pixel.
@@ -642,7 +744,9 @@ static void renderAndPushLottieFrame() {
   getPanelAbsXY(&x, &y);
 
   // Only push the animation below the overlay header so UI text persists.
-  const int animY0 = max(0, min(kOverlayH, kPanelH));
+  // For LOADING, reserve a small status strip at the top so the label remains
+  // stable without needing per-frame redraws.
+  const int animY0 = gShowLoading ? kLoadingStatusH : max(0, min(kOverlayH, kPanelH));
   const int animH = max(0, kPanelH - animY0);
   if (animH > 0) {
     tft.setSwapBytes(kSwapBytesForPushImage);
@@ -765,11 +869,7 @@ void setup() {
 
   printDisplayConfig();
 
-  // Backlight bring-up: start full-bright, blink for polarity sanity,
-  // then leave it ON.
-  setBacklight(true);
-  delay(80);
-  blinkBacklight(3);
+  // Backlight: leave it ON (no boot flashing).
   setBacklight(true);
   delay(50);
 
@@ -788,14 +888,7 @@ void setup() {
   tft.fillScreen(TFT_BLACK);
   delay(80);
 
-  // Also do a distinct backlight pattern to confirm we got past tft.init().
-  // (If you only ever see the initial 3 blinks, we didn't make it here OR BL polarity is wrong.)
-  setBacklight(false);
-  delay(80);
-  setBacklight(true);
-  delay(80);
-  setBacklight(false);
-  delay(80);
+  // Keep backlight steady (no boot flashing).
   setBacklight(true);
 
   if (kDisplayBringupMode) {
