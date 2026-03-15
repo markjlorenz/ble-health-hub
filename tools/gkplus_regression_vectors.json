@@ -88,5 +88,25 @@
       "gki": 12.0,
       "time_text": "8:46 20260307"
     }
+  },
+  {
+    "id": "2026-03-15-0926-pre",
+    "tag": "PRE",
+    "glu9": "1a030f091a005c1a11",
+    "ket9": "1a030f091900160b55",
+    "expected": {
+      "glu_when_local": "2026-03-15 09:26",
+      "ket_when_local": "2026-03-15 09:25",
+      "glucose_mgdl": 92,
+      "ketone_mmol_l_1dp": 0.2,
+      "gki_1dp": 25.5
+    },
+    "official": {
+      "glucose": 92,
+      "ketone": 0.2,
+      "gki": 25.5,
+      "time_text": "9:25AM 20260315",
+      "notes": "glu9=1a030f091a005c1a11 ket9=1a030f091900160b55"
+    }
   }
 ]

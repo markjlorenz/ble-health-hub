@@ -69,7 +69,16 @@ def run_case(d, case: dict) -> CaseResult:
     glu9 = str(case.get("glu9", ""))
     ket9 = str(case.get("ket9", ""))
     exp = case.get("expected") or {}
-    exp_when = parse_when_local(str(exp.get("when_local")))
+    exp_when_raw = exp.get("when_local")
+    exp_when_glu_raw = exp.get("glu_when_local")
+    exp_when_ket_raw = exp.get("ket_when_local")
+
+    # Back-compat: older cases store a single when_local for both.
+    if exp_when_raw is not None:
+        exp_when_glu = exp_when_ket = parse_when_local(str(exp_when_raw))
+    else:
+        exp_when_glu = parse_when_local(str(exp_when_glu_raw))
+        exp_when_ket = parse_when_local(str(exp_when_ket_raw))
     exp_glu = int(exp.get("glucose_mgdl"))
     exp_ket = float(exp.get("ketone_mmol_l_1dp"))
     exp_gki = float(exp.get("gki_1dp"))
@@ -79,11 +88,11 @@ def run_case(d, case: dict) -> CaseResult:
     if not glu or not ket:
         return CaseResult(case_id, False, "failed to decode glu9/ket9")
 
-    if glu.when_local != exp_when or ket.when_local != exp_when:
+    if glu.when_local != exp_when_glu or ket.when_local != exp_when_ket:
         return CaseResult(
             case_id,
             False,
-            f"when mismatch: glu={glu.when_local:%Y-%m-%d %H:%M} ket={ket.when_local:%Y-%m-%d %H:%M} expected={exp_when:%Y-%m-%d %H:%M}",
+            f"when mismatch: glu={glu.when_local:%Y-%m-%d %H:%M} ket={ket.when_local:%Y-%m-%d %H:%M} expected_glu={exp_when_glu:%Y-%m-%d %H:%M} expected_ket={exp_when_ket:%Y-%m-%d %H:%M}",
         )
 
     glu_shown = int(round(float(glu.value)))
