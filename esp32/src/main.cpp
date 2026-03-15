@@ -10,6 +10,11 @@
 // QRCode (ricmoo/QRCode)
 #include <qrcode.h>
 
+// BLE (NimBLE-Arduino)
+#include <NimBLEDevice.h>
+
+#include <cmath>
+
 #include <cstdint>
 #include <memory>
 #include <set>
@@ -136,8 +141,9 @@ static void applyPanelViewport();
 static void getPanelAbsXY(int* outX, int* outY);
 static void* mallocFrameBuffer(size_t bytes);
 static void renderAndPushLottieFrame();
-static void drawWifiStatusDot();
+static void drawStatusDots();
 static bool isDemoGateActive();
+static void setBleConnected(bool v);
 
 static inline uint16_t rgba8888ToRgb565(uint32_t argb) {
   // RLottie uses ARGB32 pixels.
@@ -190,23 +196,89 @@ static bool isDemoGateActive() {
   return digitalRead(kDemoGateGpio) == LOW;
 }
 
-static void drawWifiStatusDot() {
-  // Always draw (blue when connected, red when not) so we don't leave stale pixels.
+static volatile bool gBleConnected = false;
+
+// Latest GK+ reading time (from the meter): "HH:MM".
+static char gGkWhenLocal[8] = {0};
+
+// Forces a repaint of the reserved bottom status strip (time + dots). This is
+// needed because some stage transitions clear parts of the screen while the
+// placeholder values may remain constant.
+static volatile bool gStatusStripDirty = true;
+
+// Reserve a bottom strip for status (time + dots) so the animation never
+// overwrites it. This prevents visible flicker during the long pushImage.
+static constexpr int kBottomStatusH = 12;
+
+static void drawStatusDots() {
+  // Always draw dots so we don't leave stale pixels.
+  // Wi-Fi status stays in the lower-right. BLE status (green when connected) is in the lower-left.
   int ax = 0;
   int ay = 0;
   getPanelAbsXY(&ax, &ay);
 
-  static constexpr int kDot = 4;  // 4px tall (and wide)
-  const int x = ax + (kPanelW - kDot);
+  static constexpr int kDot = 4;
+  const int stripY = ay + (kPanelH - kBottomStatusH);
   const int y = ay + (kPanelH - kDot);
+  const int bleX = ax;
+  const int wifiX = ax + (kPanelW - kDot);
+
   // Use our calibrated RGB888->565 conversion (handles red/blue swap)
   // instead of TFT_* constants.
-  static const uint16_t kDotBlue = rgb888To565(0x00, 0x00, 0xFF);
-  static const uint16_t kDotRed = rgb888To565(0xFF, 0x00, 0x00);
-  const uint16_t c = (WiFi.status() == WL_CONNECTED) ? kDotBlue : kDotRed;
+  static const uint16_t kBlue = rgb888To565(0x00, 0x00, 0xFF);
+  static const uint16_t kRed = rgb888To565(0xFF, 0x00, 0x00);
+  // Darker green is less distracting and reads better on this panel.
+  static const uint16_t kGreen = rgb888To565(0x00, 0xA0, 0x00);
 
+  const bool demoPlaceholders = (kDemoMode && isDemoGateActive());
+
+  // In demo mode, show placeholder status values so the bottom strip is always
+  // populated (time + connection indicators) while cycling stages.
+  const bool wifiUp = demoPlaceholders ? true : (WiFi.status() == WL_CONNECTED);
+  const uint16_t wifiC = wifiUp ? kBlue : kRed;
+  const bool bleUp = demoPlaceholders ? true : gBleConnected;
+  const uint16_t bleC = bleUp ? kGreen : TFT_BLACK;
+
+  // Bottom status row: show time centered between dots.
+  const char* timeStr = demoPlaceholders ? "10:26" : gGkWhenLocal;
+  const bool haveTime = (timeStr && timeStr[0] != '\0');
+
+  // Only repaint if something changed (avoids flicker from "erase then redraw").
+  static bool sInited = false;
+  static bool sLastWifiUp = false;
+  static bool sLastBleUp = false;
+  static char sLastTime[sizeof(gGkWhenLocal)] = {0};
+
+  bool changed = !sInited;
+  if (gStatusStripDirty) changed = true;
+  if (sLastWifiUp != wifiUp) changed = true;
+  if (sLastBleUp != bleUp) changed = true;
+  if (strncmp(sLastTime, timeStr ? timeStr : "", sizeof(sLastTime)) != 0) changed = true;
+
+  if (!changed) {
+    return;
+  }
+
+  sInited = true;
+  sLastWifiUp = wifiUp;
+  sLastBleUp = bleUp;
+  strncpy(sLastTime, timeStr ? timeStr : "", sizeof(sLastTime));
+  sLastTime[sizeof(sLastTime) - 1] = '\0';
+  gStatusStripDirty = false;
+
+  // Clear the full strip once, then paint dots + time.
   tft.startWrite();
-  tft.fillRect(x, y, kDot, kDot, c);
+  tft.fillRect(ax, stripY, kPanelW, kBottomStatusH, TFT_BLACK);
+  tft.fillRect(bleX, y, kDot, kDot, bleC);
+  tft.fillRect(wifiX, y, kDot, kDot, wifiC);
+
+  if (haveTime) {
+    tft.setTextSize(1);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.setTextDatum(BC_DATUM);
+    tft.drawString(timeStr, ax + (kPanelW / 2), ay + kPanelH - 1);
+    tft.setTextDatum(TL_DATUM);
+  }
   tft.endWrite();
 }
 
@@ -233,11 +305,27 @@ static uint32_t gLastLottieInitAttemptMs = 0;
 static TaskHandle_t gRenderTask = nullptr;
 static bool gOverlayDirty = true;
 
+static void setBleConnected(bool v) {
+  if (gBleConnected == v) return;
+  gBleConnected = v;
+  gStatusStripDirty = true;
+}
+
 static TaskHandle_t gWifiTask = nullptr;
+static TaskHandle_t gGkTask = nullptr;
 
 static bool gShowLoading = false;
 static bool gShowNoWifi = false;
 static String gTopStatus = "";
+
+// Normal (non-demo) UI control: a background task can request which visual stage
+// should be shown. renderTask() applies the stage changes so RLottie calls are
+// serialized on the render task.
+static portMUX_TYPE gUiMux = portMUX_INITIALIZER_UNLOCKED;
+static volatile int gUiRequestedStep = 4;  // default: LOADING
+static volatile bool gUiRequestedStepDirty = true;
+
+
 
 static volatile bool gForceNoWifiScreen = false;
 static char gPortalSsid[64] = "ble-health-hub";
@@ -505,6 +593,417 @@ static void wifiTask(void* /*param*/) {
   vTaskDelete(nullptr);
 }
 
+static void requestUiStep(int step) {
+  portENTER_CRITICAL(&gUiMux);
+  if (gUiRequestedStep != step) {
+    gUiRequestedStep = step;
+    gUiRequestedStepDirty = true;
+  }
+  portEXIT_CRITICAL(&gUiMux);
+}
+
+static float computeShownGki(float glucoseMgDl, float ketoneMmolL) {
+  if (!(ketoneMmolL > 0.0f)) return NAN;
+  const float gki = (glucoseMgDl / 18.0f) / ketoneMmolL;
+  return floorf(gki * 10.0f) / 10.0f;
+}
+
+static int ketosisStageFromGki(float gki) {
+  if (!isfinite(gki)) return 4;  // LOADING fallback
+  if (gki > 9.0f) return 0;      // NOT KETOSIS
+  if (gki >= 6.0f) return 1;     // LOW KETOSIS
+  if (gki >= 3.0f) return 2;     // MID KETOSIS
+  if (gki >= 1.0f) return 3;     // HIGH KETOSIS
+  return 6;                      // !!! KETOSIS
+}
+
+static inline int64_t daysFromCivil(int y, unsigned m, unsigned d) {
+  // Howard Hinnant's algorithm: days since 1970-01-01.
+  y -= (m <= 2);
+  const int era = (y >= 0 ? y : y - 399) / 400;
+  const unsigned yoe = (unsigned)(y - era * 400);
+  const unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+  const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  return (int64_t)era * 146097 + (int64_t)doe - 719468;
+}
+
+static int64_t epochMinutesUtcLike(int year, int month, int day, int hour, int minute) {
+  const int64_t days = daysFromCivil(year, (unsigned)month, (unsigned)day);
+  return days * 1440 + (int64_t)hour * 60 + (int64_t)minute;
+}
+
+struct GkRecord {
+  int year = 0;
+  int month = 0;
+  int day = 0;
+  int hour = 0;
+  int minute = 0;
+  int64_t tMin = 0;
+  int whenKey = 0;
+  uint8_t type = 0;
+  uint8_t flags = 0;
+  enum Kind : uint8_t { UNKNOWN = 0, GLUCOSE = 1, KETONE = 2 } kind = UNKNOWN;
+  enum Prandial : uint8_t { GENERAL = 0, PRE = 1, POST = 2 } prandial = GENERAL;
+  int raw = 0;
+  float value = NAN;
+};
+
+static bool decodeGkRecordSnippet9(const uint8_t* rec9, size_t len, GkRecord* out) {
+  if (!rec9 || len != 9 || !out) return false;
+  const uint8_t yy = rec9[0];
+  const uint8_t mo = rec9[1];
+  const uint8_t dd = rec9[2];
+  const uint8_t hh = rec9[3];
+  const uint8_t mi = rec9[4];
+  const int year = 2000 + (int)yy;
+  const int whenKey = year * 100000000 + (int)mo * 1000000 + (int)dd * 10000 + (int)hh * 100 + (int)mi;
+  const int raw = (int)rec9[5] * 100 + (int)rec9[6];
+  const uint8_t flags = rec9[7];
+  const uint8_t prNib = (flags >> 4) & 0x0F;
+  const uint8_t type = rec9[8];
+
+  GkRecord r;
+  r.year = year;
+  r.month = (int)mo;
+  r.day = (int)dd;
+  r.hour = (int)hh;
+  r.minute = (int)mi;
+  r.tMin = epochMinutesUtcLike(r.year, r.month, r.day, r.hour, r.minute);
+  r.whenKey = whenKey;
+  r.type = type;
+  r.flags = flags;
+  r.raw = raw;
+  r.prandial = (prNib == 1) ? GkRecord::PRE : (prNib == 2) ? GkRecord::POST : GkRecord::GENERAL;
+  r.kind = GkRecord::UNKNOWN;
+  r.value = NAN;
+
+  if (type == 0x11 || type == 0x12 || type == 0x22) {
+    r.kind = GkRecord::GLUCOSE;
+    r.value = (float)raw;  // mg/dL
+  } else if (type == 0x55 || type == 0x56 || type == 0x66) {
+    r.kind = GkRecord::KETONE;
+    r.value = (float)raw / 100.0f;  // mmol/L
+  }
+
+  *out = r;
+  return true;
+}
+
+static uint16_t crc16Modbus(const uint8_t* data, size_t len) {
+  uint16_t crc = 0xFFFF;
+  for (size_t i = 0; i < len; i++) {
+    crc ^= (uint16_t)data[i];
+    for (int j = 0; j < 8; j++) {
+      if (crc & 1) crc = (uint16_t)((crc >> 1) ^ 0xA001);
+      else crc = (uint16_t)(crc >> 1);
+    }
+  }
+  return crc;
+}
+
+static void crcSendBytesFromCrc16(uint16_t crc16, uint8_t out4[4]) {
+  // Matches APK: 4 hex digits -> nibble-bytes, then swap pairs.
+  const uint8_t n0 = (crc16 >> 12) & 0x0F;
+  const uint8_t n1 = (crc16 >> 8) & 0x0F;
+  const uint8_t n2 = (crc16 >> 4) & 0x0F;
+  const uint8_t n3 = (crc16 >> 0) & 0x0F;
+  out4[0] = n2;
+  out4[1] = n3;
+  out4[2] = n0;
+  out4[3] = n1;
+}
+
+static void buildLatestRecords16Command(uint16_t param, std::vector<uint8_t>* out) {
+  if (!out) return;
+  out->clear();
+
+  // Body bytes: 01 10 01 20 16 55 00 02 <param_hi> <param_lo>
+  uint8_t body[10] = {0x01, 0x10, 0x01, 0x20, 0x16, 0x55, 0x00, 0x02,
+                      (uint8_t)((param >> 8) & 0xFF), (uint8_t)(param & 0xFF)};
+  const uint16_t crc = crc16Modbus(body, sizeof(body));
+  uint8_t crc4[4] = {0};
+  crcSendBytesFromCrc16(crc, crc4);
+
+  out->reserve(1 + sizeof(body) + sizeof(crc4) + 1);
+  out->push_back(0x7B);
+  out->insert(out->end(), body, body + sizeof(body));
+  out->insert(out->end(), crc4, crc4 + sizeof(crc4));
+  out->push_back(0x7D);
+}
+
+static bool advLooksLikeGkPlus(const NimBLEAdvertisedDevice& d) {
+  // Most reliable observed filter: Service Data (AD type 0x16) with UUID 0x78ac.
+  // As a fallback, accept devices whose name includes "Keto-Mojo".
+  const std::string name = d.getName();
+  if (!name.empty() && name.find("Keto-Mojo") != std::string::npos) {
+    return true;
+  }
+
+  const int n = d.getServiceDataCount();
+  for (int i = 0; i < n; i++) {
+    const NimBLEUUID u = d.getServiceDataUUID(i);
+    if (u.equals(NimBLEUUID((uint16_t)0x78ac)) || u.equals(NimBLEUUID((uint16_t)0xac78))) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static void gkplusTask(void* /*param*/) {
+  Serial.println("GK+: task start");
+
+  NimBLEDevice::init("");
+  NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+
+  // Always start in LOADING.
+  requestUiStep(4);
+
+  // GK+ GATT UUIDs (pcap-derived, canonical).
+  const NimBLEUUID kSvc("0003cdd0-0000-1000-8000-00805f9b0131");
+  const NimBLEUUID kNotify("0003cdd1-0000-1000-8000-00805f9b0131");
+  const NimBLEUUID kWrite("0003cdd2-0000-1000-8000-00805f9b0131");
+
+  // Observed constant requests.
+  static const uint8_t kReqInfo66[] = {0x7b, 0x01, 0x10, 0x01, 0x20, 0x66, 0x55, 0x00, 0x00, 0x01, 0x0e, 0x08, 0x08, 0x7d};
+  static const uint8_t kReqInitAa[] = {0x7b, 0x01, 0x10, 0x01, 0x20, 0xaa, 0x55, 0x00, 0x00, 0x02, 0x01, 0x0d, 0x08, 0x7d};
+  static const uint8_t kReqInfo77[] = {0x7b, 0x01, 0x10, 0x01, 0x20, 0x77, 0x55, 0x00, 0x00, 0x01, 0x0b, 0x0b, 0x04, 0x7d};
+  static const uint8_t kReqCountDb[] = {0x7b, 0x01, 0x10, 0x01, 0x20, 0xdb, 0x55, 0x00, 0x00, 0x03, 0x0a, 0x0e, 0x04, 0x7d};
+
+  struct Session {
+    std::vector<GkRecord> raw;
+    volatile bool gotDbCount = false;
+    volatile bool gotReading = false;
+  };
+
+  static Session* sSession = nullptr;
+  static auto onNotify = [](NimBLERemoteCharacteristic* /*c*/, uint8_t* data, size_t len, bool /*isNotify*/) {
+    Session* sess = sSession;
+    if (!sess || !data || len == 0) return;
+
+    // Split concatenated frames (0x7b..0x7d).
+    size_t i = 0;
+    while (i < len) {
+      while (i < len && data[i] != 0x7B) i++;
+      if (i >= len) break;
+      size_t j = i + 1;
+      while (j < len && data[j] != 0x7D) j++;
+      if (j >= len) break;
+
+      const uint8_t* f = data + i;
+      const size_t flen = (j - i) + 1;
+      i = j + 1;
+
+      if (flen < 12) continue;
+      const uint8_t cmd = f[5];
+
+      // Records-count response: 7b 01 20 01 10 db aa 00 02 <count2> <crc4> 7d
+      if (cmd == 0xDB && flen >= 16 && f[6] == 0xAA) {
+        sess->gotDbCount = true;
+        continue;
+      }
+
+      // Record transfer frame: 7b 01 20 01 10 (16|dd|de) aa 00 09 <record9> <crc4> 7d
+      if ((cmd == 0x16 || cmd == 0xDD || cmd == 0xDE) && flen >= 23 && f[6] == 0xAA && f[7] == 0x00 && f[8] == 0x09) {
+        GkRecord r;
+        if (!decodeGkRecordSnippet9(f + 9, 9, &r)) continue;
+        if (r.kind == GkRecord::UNKNOWN) continue;
+        if (!isfinite(r.value)) continue;
+        sess->raw.push_back(r);
+        if (sess->raw.size() > 16) {
+          sess->raw.erase(sess->raw.begin(), sess->raw.begin() + (sess->raw.size() - 16));
+        }
+
+        // Best-effort pairing: choose most recent glucose+ketone within 15 minutes.
+        const int windowMin = 15;
+        const GkRecord* bestG = nullptr;
+        const GkRecord* bestK = nullptr;
+        int64_t bestKey = -1;
+        for (const auto& g : sess->raw) {
+          if (g.kind != GkRecord::GLUCOSE) continue;
+          for (const auto& k : sess->raw) {
+            if (k.kind != GkRecord::KETONE) continue;
+            const int64_t dt = (k.tMin > g.tMin) ? (k.tMin - g.tMin) : (g.tMin - k.tMin);
+            if (dt > windowMin) continue;
+            const int64_t key = (int64_t)max(g.whenKey, k.whenKey);
+            if (key > bestKey) {
+              bestKey = key;
+              bestG = &g;
+              bestK = &k;
+            }
+          }
+        }
+
+        if (bestG && bestK) {
+          const float glucose = bestG->value;
+          const float ketone = bestK->value;
+          const float gki = computeShownGki(glucose, ketone);
+          const int stage = ketosisStageFromGki(gki);
+
+          portENTER_CRITICAL(&gUiMux);
+          gGluMgDl = glucose;
+          gKetMmolL = ketone;
+          gGkiOverride = true;
+          gGkiValue = gki;
+          snprintf(gGkWhenLocal, sizeof(gGkWhenLocal), "%02d:%02d", bestG->hour, bestG->minute);
+          gStatusStripDirty = true;
+          gOverlayDirty = true;
+          portEXIT_CRITICAL(&gUiMux);
+
+          requestUiStep(stage);
+          sess->gotReading = true;
+        }
+      }
+    }
+  };
+
+  // Connect loop: connect directly to a known GK+ MAC address.
+  // NOTE: This assumes the meter uses a stable public address (not a rotating
+  // resolvable private address).
+  static const char kGkPlusMac[] = "e4:33:bb:84:83:66";
+  const NimBLEAddress gkAddrPublic(std::string(kGkPlusMac), 0 /* public */);
+  const NimBLEAddress gkAddrRandom(std::string(kGkPlusMac), 1 /* random */);
+
+  // Keep trying until we decode a reading.
+  for (;;) {
+    if (isDemoGateActive()) {
+      vTaskDelay(pdMS_TO_TICKS(500));
+      continue;
+    }
+    requestUiStep(4);
+
+    // Create a fresh client each attempt.
+    Serial.printf("GK+: connect %s\n", kGkPlusMac);
+
+    NimBLEClient* client = NimBLEDevice::createClient();
+    if (!client) {
+      vTaskDelay(pdMS_TO_TICKS(1000));
+      continue;
+    }
+
+    // Default is 30s; shorten so failures are less painful.
+    client->setConnectTimeout(8000);
+
+    // Some GK+ units use a stable address but advertise it as "random".
+    // Try random first, then public, with minimal logging.
+    int errRandom = 0;
+    int errPublic = 0;
+    bool okConn = client->connect(gkAddrRandom);
+    if (!okConn) {
+      errRandom = client->getLastError();
+      okConn = client->connect(gkAddrPublic);
+      if (!okConn) {
+        errPublic = client->getLastError();
+      }
+    }
+
+    if (!okConn) {
+      Serial.printf("GK+: connect failed (random=%d public=%d)\n", errRandom, errPublic);
+      NimBLEDevice::deleteClient(client);
+      vTaskDelay(pdMS_TO_TICKS(1000));
+      continue;
+    }
+
+    setBleConnected(true);
+    Serial.println("GK+: connected");
+
+    NimBLERemoteService* svc = client->getService(kSvc);
+    if (!svc) {
+      setBleConnected(false);
+      client->disconnect();
+      NimBLEDevice::deleteClient(client);
+      vTaskDelay(pdMS_TO_TICKS(1200));
+      continue;
+    }
+
+    NimBLERemoteCharacteristic* chNotify = svc->getCharacteristic(kNotify);
+    NimBLERemoteCharacteristic* chWrite = svc->getCharacteristic(kWrite);
+    if (!chNotify || !chWrite) {
+      setBleConnected(false);
+      client->disconnect();
+      NimBLEDevice::deleteClient(client);
+      vTaskDelay(pdMS_TO_TICKS(1200));
+      continue;
+    }
+
+    Session sess;
+    sess.raw.reserve(8);
+    sSession = &sess;
+
+    if (!chNotify->subscribe(true, onNotify)) {
+      sSession = nullptr;
+      setBleConnected(false);
+      Serial.println("GK+: subscribe failed");
+      client->disconnect();
+      NimBLEDevice::deleteClient(client);
+      vTaskDelay(pdMS_TO_TICKS(1200));
+      continue;
+    }
+
+    auto writeFrame = [&](const uint8_t* buf, size_t n, bool withResponse, const char* label) {
+      if (!buf || n == 0) return;
+      const bool ok = chWrite->writeValue(buf, n, withResponse);
+      Serial.printf("GK+: TX %s (%u bytes) => %s\n", label ? label : "", (unsigned)n, ok ? "OK" : "FAIL");
+    };
+
+    // Best-effort init sequence (from pcaps/web app). We intentionally do NOT
+    // send set-time here because the ESP32 currently has no trusted clock.
+    writeFrame(kReqInfo66, sizeof(kReqInfo66), false, "0x66");
+    vTaskDelay(pdMS_TO_TICKS(120));
+    writeFrame(kReqInitAa, sizeof(kReqInitAa), false, "0xAA");
+    vTaskDelay(pdMS_TO_TICKS(120));
+    writeFrame(kReqInfo77, sizeof(kReqInfo77), false, "0x77");
+    vTaskDelay(pdMS_TO_TICKS(120));
+    writeFrame(kReqInfo66, sizeof(kReqInfo66), false, "0x66 (again)");
+    vTaskDelay(pdMS_TO_TICKS(120));
+
+    // Request records count; the notify handler will cause us to request records.
+    writeFrame(kReqCountDb, sizeof(kReqCountDb), false, "0xDB (records count)");
+
+    Serial.println("GK+: waiting for records...");
+
+    const uint32_t t0 = millis();
+    std::vector<uint8_t> cmd16;
+    bool sentXfer = false;
+    for (;;) {
+      if (isDemoGateActive()) break;
+      if (!client->isConnected()) break;
+      if (sess.gotReading) break;
+
+      const uint32_t elapsed = millis() - t0;
+      if (elapsed > 8000) {
+        Serial.println("GK+: timeout waiting for reading; retry");
+        break;
+      }
+
+      if (sess.gotDbCount && !sentXfer) {
+        sentXfer = true;
+        // For "latest complete reading" we request 2 records (glucose + ketone).
+        buildLatestRecords16Command(2, &cmd16);
+        if (!cmd16.empty()) {
+          writeFrame(cmd16.data(), cmd16.size(), false, "0x16 (latest records n=2)");
+        }
+      }
+
+      vTaskDelay(pdMS_TO_TICKS(100));
+    }
+
+    const bool okReading = sess.gotReading;
+
+    sSession = nullptr;
+    setBleConnected(false);
+    client->disconnect();
+    NimBLEDevice::deleteClient(client);
+
+    if (okReading) {
+      Serial.println("GK+: reading acquired; task done");
+      vTaskDelete(nullptr);
+      return;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(800));
+  }
+}
+
 static uint32_t gDemoStartMs = 0;
 
 static size_t gLoopStartFrame = 0;
@@ -611,7 +1110,7 @@ static void drawOverlay() {
     tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
     tft.drawString("Scan to setup", kPanelW / 2, qrY + qrPx + 8);
     tft.setTextDatum(TL_DATUM);
-    drawWifiStatusDot();
+    drawStatusDots();
     return;
   }
 
@@ -677,7 +1176,7 @@ static void drawOverlay() {
     tft.setTextDatum(TL_DATUM);
   }
 
-  drawWifiStatusDot();
+  drawStatusDots();
 }
 
 static void fillTestPattern565(uint16_t* buf) {
@@ -897,103 +1396,88 @@ static void setAllLayersOpacityPct(float opacityPct) {
   }
 }
 
-static void applyDemoStep(int step) {
+static void applyUiStepVisual(int step) {
+  // Visual-only stage applier (no measurement values). Called from renderTask()
+  // so RLottie setValue() calls are serialized.
   gShowLoading = false;
   gShowNoWifi = false;
-  gTopStatus = "";
 
-  // Step meanings per user spec.
   switch (step) {
     case 0: {
-      gGluMgDl = 81.0f;
-      gKetMmolL = 0.3f;
-      gGkiOverride = true;
-      gGkiValue = 15.0f;
+      gTopStatus = "";
       gKetosisLabel = "NOT KETOSIS";
       gKetosisLabelBg = gKetosisBrown565;
       gKetosisLabelFg = TFT_WHITE;
 
-      // Only Logs visible.
       setAllLayersOpacityPct(0.0f);
       setLayerOpacityPct("Logs", 100.0f);
-
       setLoopToFlameBurn();
       break;
     }
     case 1: {
-      gGluMgDl = 109.0f;
-      gKetMmolL = 1.0f;
-      gGkiOverride = true;
-      gGkiValue = 6.0f;
+      gTopStatus = "";
       gKetosisLabel = "LOW KETOSIS";
       gKetosisLabelBg = gKetosisOrange565;
       gKetosisLabelFg = TFT_WHITE;
 
-      // Logs + Orange Container + Yellow Container.
       setAllLayersOpacityPct(0.0f);
       setLayerOpacityPct("Logs", 100.0f);
       setLayerOpacityPct("Orange Container", 100.0f);
       setLayerOpacityPct("Yellow Container", 100.0f);
-
       setLoopToFlameBurn();
       break;
     }
     case 2: {
-      gGluMgDl = 110.0f;
-      gKetMmolL = 1.2f;
-      gGkiOverride = true;
-      gGkiValue = 5.1f;
+      gTopStatus = "";
       gKetosisLabel = "MID KETOSIS";
       gKetosisLabelBg = gKetosisYellow565;
       gKetosisLabelFg = TFT_BLACK;
 
-      // All visible except BigRed Container and the red whisp element.
       setAllLayersOpacityPct(100.0f);
       setLayerOpacityPct("BigRed Container", 0.0f);
       setLayerOpacityPct("SideRed Container", 0.0f);
-
       setLoopToFlameBurn();
       break;
     }
     case 3: {
-      gGluMgDl = 82.0f;
-      gKetMmolL = 3.6f;
-      gGkiOverride = true;
-      gGkiValue = 1.3f;
+      gTopStatus = "";
       gKetosisLabel = "HIGH KETOSIS";
       gKetosisLabelBg = gKetosisRed565;
       gKetosisLabelFg = TFT_WHITE;
 
-      // All layers visible.
       setAllLayersOpacityPct(100.0f);
+      setLoopToFlameBurn();
+      break;
+    }
+    case 6: {
+      gTopStatus = "";
+      gKetosisLabel = "!!! KETOSIS";
+      gKetosisLabelBg = gKetosisRed565;
+      gKetosisLabelFg = TFT_WHITE;
 
+      setAllLayersOpacityPct(100.0f);
       setLoopToFlameBurn();
       break;
     }
     case 4: {
-      // New stage: Log Loading
       gShowLoading = true;
       gTopStatus = "LOADING";
       gKetosisLabel = "";
       gKetosisLabelBg = TFT_BLACK;
       gKetosisLabelFg = TFT_WHITE;
 
-      // Keep this stage simple: only Logs visible.
       setAllLayersOpacityPct(0.0f);
       setLayerOpacityPct("Logs", 100.0f);
-
       setLoopToLogLoading();
       break;
     }
     case 5: {
-      // New stage: No Wi-Fi
       gShowNoWifi = true;
       gTopStatus = "NO WIFI";
       gKetosisLabel = "";
       gKetosisLabelBg = TFT_BLACK;
       gKetosisLabelFg = TFT_WHITE;
 
-      // Hide all animation layers while this static screen is shown.
       setAllLayersOpacityPct(0.0f);
       break;
     }
@@ -1002,13 +1486,67 @@ static void applyDemoStep(int step) {
   }
 
   gOverlayDirty = true;
+  gStatusStripDirty = true;
+}
+
+static void applyDemoStep(int step) {
+  // Demo mode shows a sample time so we can preview bottom-row timestamp.
+  snprintf(gGkWhenLocal, sizeof(gGkWhenLocal), "%02d:%02d", 10, 26);
+
+  // Step meanings per user spec.
+  switch (step) {
+    case 0: {
+      gGluMgDl = 81.0f;
+      gKetMmolL = 0.3f;
+      gGkiOverride = true;
+      gGkiValue = 15.0f;
+      // Visuals handled by applyUiStepVisual().
+      break;
+    }
+    case 1: {
+      gGluMgDl = 109.0f;
+      gKetMmolL = 1.0f;
+      gGkiOverride = true;
+      gGkiValue = 6.0f;
+      // Visuals handled by applyUiStepVisual().
+      break;
+    }
+    case 2: {
+      gGluMgDl = 110.0f;
+      gKetMmolL = 1.2f;
+      gGkiOverride = true;
+      gGkiValue = 5.1f;
+      // Visuals handled by applyUiStepVisual().
+      break;
+    }
+    case 3: {
+      gGluMgDl = 82.0f;
+      gKetMmolL = 3.6f;
+      gGkiOverride = true;
+      gGkiValue = 1.3f;
+      // Visuals handled by applyUiStepVisual().
+      break;
+    }
+    case 4: {
+      // Visuals handled by applyUiStepVisual().
+      break;
+    }
+    case 5: {
+      // Visuals handled by applyUiStepVisual().
+      break;
+    }
+    default:
+      break;
+  }
+
+  applyUiStepVisual(step);
 }
 
 static void renderTask(void* /*param*/) {
   // RLottie's render pipeline can be stack-hungry. Running it inside Arduino's
   // default loopTask has been observed to overflow the stack on ESP32-S3.
   // This task is created with a larger stack.
-  int demoStep = -1;
+  int appliedStep = -1;
   for (;;) {
     const uint32_t now = millis();
 
@@ -1024,21 +1562,39 @@ static void renderTask(void* /*param*/) {
                     demoGate ? "LOW" : "HIGH");
     }
 
-    if (kDemoMode && gLottieReady) {
-      if (gDemoStartMs == 0) {
-        gDemoStartMs = now;
-      }
-      static constexpr int kDemoSteps = 6;
-      static constexpr int kDemoOrder[kDemoSteps] = {4, 5, 0, 1, 2, 3};
-      const int idx = (int)(((now - gDemoStartMs) / kDemoStepMs) % kDemoSteps);
-      int nextStep = 4;
-      if (demoGate) {
-        nextStep = (gForceNoWifiScreen ? 5 : kDemoOrder[idx]);
-      }
-      if (nextStep != demoStep) {
-        demoStep = nextStep;
-        Serial.printf("DEMO: step=%d\n", demoStep);
-        applyDemoStep(demoStep);
+    if (gLottieReady) {
+      if (kDemoMode && demoGate) {
+        if (gDemoStartMs == 0) {
+          gDemoStartMs = now;
+        }
+        static constexpr int kDemoSteps = 6;
+        static constexpr int kDemoOrder[kDemoSteps] = {4, 5, 0, 1, 2, 3};
+        const int idx = (int)(((now - gDemoStartMs) / kDemoStepMs) % kDemoSteps);
+        const int nextStep = (gForceNoWifiScreen ? 5 : kDemoOrder[idx]);
+        if (nextStep != appliedStep) {
+          appliedStep = nextStep;
+          Serial.printf("DEMO: step=%d\n", appliedStep);
+          applyDemoStep(appliedStep);
+        }
+      } else {
+        // Normal mode: apply the step requested by background tasks (e.g. GK+).
+        int req = 4;
+        bool dirty = false;
+        portENTER_CRITICAL(&gUiMux);
+        req = gUiRequestedStep;
+        dirty = gUiRequestedStepDirty;
+        gUiRequestedStepDirty = false;
+        portEXIT_CRITICAL(&gUiMux);
+
+        if (gForceNoWifiScreen) {
+          req = 5;
+        }
+
+        if (dirty || req != appliedStep) {
+          appliedStep = req;
+          Serial.printf("UI: step=%d\n", appliedStep);
+          applyUiStepVisual(appliedStep);
+        }
       }
     }
 
@@ -1163,7 +1719,8 @@ static void renderAndPushLottieFrame() {
   // For LOADING, reserve a small status strip at the top so the label remains
   // stable without needing per-frame redraws.
   const int animY0 = gShowLoading ? kLoadingStatusH : max(0, min(kOverlayH, kPanelH));
-  const int animH = max(0, kPanelH - animY0);
+  // Also reserve a bottom status strip for time + dots.
+  const int animH = max(0, (kPanelH - kBottomStatusH) - animY0);
   if (animH > 0) {
     tft.setSwapBytes(kSwapBytesForPushImage);
     tft.startWrite();
@@ -1178,7 +1735,7 @@ static void renderAndPushLottieFrame() {
   }
 
   // Always draw the Wi-Fi status dot last so it stays visible on top.
-  drawWifiStatusDot();
+  drawStatusDots();
 }
 
 static void setBacklight(bool on) {
@@ -1339,6 +1896,14 @@ void setup() {
     const BaseType_t ok = xTaskCreatePinnedToCore(
         wifiTask, "wifiTask", stackDepthWords, nullptr, 1, &gWifiTask, 0);
     Serial.printf("wifiTask create: %s\n", (ok == pdPASS) ? "OK" : "FAIL");
+  }
+
+  // Start GK+ BLE download in the background (normal mode when demo gate is OFF).
+  if (!gGkTask) {
+    const uint32_t stackDepthWords = 12288;  // 48KB
+    const BaseType_t ok = xTaskCreatePinnedToCore(
+        gkplusTask, "gkplusTask", stackDepthWords, nullptr, 1, &gGkTask, 0);
+    Serial.printf("gkplusTask create: %s\n", (ok == pdPASS) ? "OK" : "FAIL");
   }
 
   // Run rendering in a separate task with a larger stack to avoid loopTask

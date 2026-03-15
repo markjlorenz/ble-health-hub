@@ -5,8 +5,15 @@ Goal: a standalone ESP32 app that shows GK+ + pulse-ox values on a **76x284 TFT*
 ## Status
 
 - Current milestone: **display bring-up + animation** (full-screen Lottie playback)
-- BLE is not wired up yet.
+- GK+ BLE auto-connect + latest-reading download is working (connects to a fixed meter MAC).
 - Demo/test screens are gated behind a strap: **GPIO5 to GND enables demo mode**; if not grounded, the firmware shows **LOADING only**.
+
+### GK+ MAC address
+
+Right now the firmware connects directly to a specific GK+ meter by MAC address.
+
+- Configure it in `esp32/src/main.cpp` as `kGkPlusMac`.
+- The code will try the MAC as both "random" and "public" address types (some units use a stable address but advertise it as random).
 
 ## Prereqs
 
@@ -212,7 +219,7 @@ TODO:
     - show the loading screen during this time.
 - Add screen for Pulse Ox
 - Use real GKI levels
-    Ketosis Levels:
+    GKI Levels:
     > 9     - NOT  KETOSIS
     >=6, <9 - LOW  KETOSIS
     >=3, <6 - MID  KETOSIS
