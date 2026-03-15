@@ -1,12 +1,27 @@
 #include <Arduino.h>
 #include <TFT_eSPI.h>
 
+#include <WiFi.h>
+#include <WiFiSTA.h>
+
+// WiFiManager (tzapu/WiFiManager)
+#include <WiFiManager.h>
+
+// QRCode (ricmoo/QRCode)
+#include <qrcode.h>
+
 #include <cstdint>
 #include <memory>
 #include <set>
 #include <string>
 #include <tuple>
 #include <vector>
+
+#if __has_include(<esp_wifi.h>)
+extern "C" {
+#include <esp_wifi.h>
+}
+#endif
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -38,6 +53,11 @@ static constexpr bool kSwapRedBlueInConvert = true;
 // Demo mode: cycles through ketosis states and toggles Lottie layer visibility.
 static constexpr bool kDemoMode = true;
 static constexpr uint32_t kDemoStepMs = 4500;
+
+// Demo gate: only run the full demo loop when this GPIO is grounded.
+// Uses the internal pull-up, so leaving it floating will read HIGH (demo off).
+// Picked to avoid common strapping pins and to avoid TFT pins.
+static constexpr int kDemoGateGpio = 5;
 
 // Physical visible window is 76px wide.
 static constexpr int kPanelW = 76;
@@ -116,6 +136,8 @@ static void applyPanelViewport();
 static void getPanelAbsXY(int* outX, int* outY);
 static void* mallocFrameBuffer(size_t bytes);
 static void renderAndPushLottieFrame();
+static void drawWifiStatusDot();
+static bool isDemoGateActive();
 
 static inline uint16_t rgba8888ToRgb565(uint32_t argb) {
   // RLottie uses ARGB32 pixels.
@@ -163,6 +185,31 @@ static inline uint16_t rgba8888ToRgb565(uint32_t argb) {
   return (uint16_t)(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
 }
 
+static bool isDemoGateActive() {
+  // LOW means the pin is grounded.
+  return digitalRead(kDemoGateGpio) == LOW;
+}
+
+static void drawWifiStatusDot() {
+  // Always draw (blue when connected, red when not) so we don't leave stale pixels.
+  int ax = 0;
+  int ay = 0;
+  getPanelAbsXY(&ax, &ay);
+
+  static constexpr int kDot = 4;  // 4px tall (and wide)
+  const int x = ax + (kPanelW - kDot);
+  const int y = ay + (kPanelH - kDot);
+  // Use our calibrated RGB888->565 conversion (handles red/blue swap)
+  // instead of TFT_* constants.
+  static const uint16_t kDotBlue = rgb888To565(0x00, 0x00, 0xFF);
+  static const uint16_t kDotRed = rgb888To565(0xFF, 0x00, 0x00);
+  const uint16_t c = (WiFi.status() == WL_CONNECTED) ? kDotBlue : kDotRed;
+
+  tft.startWrite();
+  tft.fillRect(x, y, kDot, kDot, c);
+  tft.endWrite();
+}
+
 static inline bool isNearWhiteRgb(uint32_t argb, uint8_t thresh) {
   const uint8_t r = (uint8_t)((argb >> 16) & 0xFF);
   const uint8_t g = (uint8_t)((argb >> 8) & 0xFF);
@@ -186,8 +233,277 @@ static uint32_t gLastLottieInitAttemptMs = 0;
 static TaskHandle_t gRenderTask = nullptr;
 static bool gOverlayDirty = true;
 
+static TaskHandle_t gWifiTask = nullptr;
+
 static bool gShowLoading = false;
+static bool gShowNoWifi = false;
 static String gTopStatus = "";
+
+static volatile bool gForceNoWifiScreen = false;
+static char gPortalSsid[64] = "ble-health-hub";
+static char gPortalQrPayload[160] = {0};
+
+static void wifiQrEscape(const char* in, char* out, size_t outSize) {
+  if (outSize == 0) return;
+  size_t j = 0;
+  for (size_t i = 0; in && in[i] != '\0'; i++) {
+    const char ch = in[i];
+    const bool esc = (ch == '\\' || ch == ';' || ch == ',' || ch == ':');
+    if (esc) {
+      if (j + 2 >= outSize) break;
+      out[j++] = '\\';
+      out[j++] = ch;
+    } else {
+      if (j + 1 >= outSize) break;
+      out[j++] = ch;
+    }
+  }
+  out[j] = '\0';
+}
+
+static void updatePortalQrPayload() {
+  // Encode a WiFi QR that joins the WiFiManager AP (usually open / nopass).
+  // Format: WIFI:T:nopass;S:<ssid>;;
+  char ssidEsc[96] = {0};
+  wifiQrEscape(gPortalSsid, ssidEsc, sizeof(ssidEsc));
+  snprintf(gPortalQrPayload, sizeof(gPortalQrPayload), "WIFI:T:nopass;S:%s;;", ssidEsc);
+}
+
+static void onWmApStarted(WiFiManager* wm) {
+  if (!wm) return;
+  const String ssid = wm->getConfigPortalSSID();
+  if (ssid.length() > 0) {
+    snprintf(gPortalSsid, sizeof(gPortalSsid), "%s", ssid.c_str());
+    updatePortalQrPayload();
+  }
+  gForceNoWifiScreen = true;
+  gOverlayDirty = true;
+  Serial.printf("WIFI: portal started ssid='%s'\n", gPortalSsid);
+}
+
+static void drawQrCodeFromText(const char* text, int x0, int y0, int scale, int quiet) {
+  if (!text || text[0] == '\0') return;
+  static constexpr int kQrVersion = 3;
+  static constexpr int kQrSize = 4 * kQrVersion + 17;  // 29
+  static constexpr int kQrBufBytes = ((kQrSize * kQrSize) + 7) / 8;  // 106
+  static uint8_t qrcodeData[kQrBufBytes];
+  QRCode qr;
+  if (qrcode_initText(&qr, qrcodeData, kQrVersion, ECC_LOW, text) < 0) {
+    // Too much data for the chosen version; clear area and bail.
+    const int px = (kQrSize + 2 * quiet) * scale;
+    tft.fillRect(x0, y0, px, px, TFT_BLACK);
+    return;
+  }
+
+  const int size = qr.size;
+  const int px = (size + 2 * quiet) * scale;
+  tft.fillRect(x0, y0, px, px, TFT_BLACK);
+  for (int y = 0; y < size; y++) {
+    for (int x = 0; x < size; x++) {
+      if (qrcode_getModule(&qr, x, y)) {
+        tft.fillRect(x0 + (x + quiet) * scale, y0 + (y + quiet) * scale, scale, scale, TFT_WHITE);
+      }
+    }
+  }
+}
+
+// RTC Wi-Fi cache: persists across reset/deep sleep (but not power loss).
+// Purpose: speed up Wi-Fi association by pinning the last known AP channel and
+// BSSID, and optionally pre-setting last IP config.
+struct RtcWifiCache {
+  uint32_t magic;
+  uint32_t checksum;
+  uint8_t bssid[6];
+  uint8_t channel;
+  uint8_t reserved[1];
+
+  uint32_t ip;
+  uint32_t gateway;
+  uint32_t subnet;
+  uint32_t dns1;
+  uint32_t dns2;
+};
+
+static constexpr uint32_t kRtcWifiMagic = 0x57494649u; // 'WIFI'
+RTC_DATA_ATTR static RtcWifiCache gRtcWifiCache;
+
+static uint32_t rtcWifiChecksum(const RtcWifiCache& c) {
+  // Simple, deterministic checksum (not cryptographic).
+  uint32_t x = 0xA5A5F00Du;
+  x ^= c.magic;
+  x ^= (uint32_t)c.channel;
+  for (int i = 0; i < 6; i++) {
+    x = (x << 5) ^ (x >> 27) ^ (uint32_t)c.bssid[i];
+  }
+  x ^= c.ip;
+  x ^= c.gateway;
+  x ^= c.subnet;
+  x ^= c.dns1;
+  x ^= c.dns2;
+  return x;
+}
+
+static bool rtcWifiCacheValid() {
+  if (gRtcWifiCache.magic != kRtcWifiMagic) return false;
+  const uint32_t want = rtcWifiChecksum(gRtcWifiCache);
+  return want == gRtcWifiCache.checksum;
+}
+
+static void rtcWifiCacheClear() {
+  memset(&gRtcWifiCache, 0, sizeof(gRtcWifiCache));
+}
+
+static void rtcWifiCacheUpdateFromCurrent() {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  RtcWifiCache next{};
+  next.magic = kRtcWifiMagic;
+
+  const uint8_t* b = WiFi.BSSID();
+  if (b) {
+    memcpy(next.bssid, b, 6);
+  }
+  const int32_t ch = WiFi.channel();
+  next.channel = (uint8_t)max<int32_t>(0, min<int32_t>(255, ch));
+
+  next.ip = (uint32_t)WiFi.localIP();
+  next.gateway = (uint32_t)WiFi.gatewayIP();
+  next.subnet = (uint32_t)WiFi.subnetMask();
+  next.dns1 = (uint32_t)WiFi.dnsIP(0);
+  next.dns2 = (uint32_t)WiFi.dnsIP(1);
+
+  next.checksum = rtcWifiChecksum(next);
+  gRtcWifiCache = next;
+
+  Serial.printf("WIFI: cached ip=%s bssid=%s ch=%d\n",
+                WiFi.localIP().toString().c_str(),
+                WiFi.BSSIDstr().c_str(),
+                (int)next.channel);
+}
+
+static bool readStoredStaConfig(String* outSsid, String* outPass) {
+#if __has_include(<esp_wifi.h>)
+  wifi_config_t conf{};
+  const esp_err_t err = esp_wifi_get_config(WIFI_IF_STA, &conf);
+  if (err != ESP_OK) {
+    return false;
+  }
+  const char* ssid = (const char*)conf.sta.ssid;
+  const char* pass = (const char*)conf.sta.password;
+  if (!ssid || ssid[0] == '\0') {
+    return false;
+  }
+  if (outSsid) *outSsid = String(ssid);
+  if (outPass) *outPass = pass ? String(pass) : String("");
+  return true;
+#else
+  (void)outSsid;
+  (void)outPass;
+  return false;
+#endif
+}
+
+static bool waitForWifiConnected(uint32_t timeoutMs) {
+  const uint32_t t0 = millis();
+  while ((millis() - t0) < timeoutMs) {
+    if (WiFi.status() == WL_CONNECTED) return true;
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
+  return (WiFi.status() == WL_CONNECTED);
+}
+
+static bool tryFastConnectFromRtc(uint32_t timeoutMs) {
+  if (!rtcWifiCacheValid()) return false;
+
+  String ssid;
+  String pass;
+  if (!readStoredStaConfig(&ssid, &pass)) {
+    Serial.println("WIFI: RTC cache present but no stored SSID (skipping fast connect)");
+    return false;
+  }
+
+  const uint8_t ch = gRtcWifiCache.channel;
+  const bool hasBssid = (gRtcWifiCache.bssid[0] | gRtcWifiCache.bssid[1] | gRtcWifiCache.bssid[2] |
+                         gRtcWifiCache.bssid[3] | gRtcWifiCache.bssid[4] | gRtcWifiCache.bssid[5]) != 0;
+
+  Serial.printf("WIFI: fast connect ssid='%s' ch=%u bssid=%s\n",
+                ssid.c_str(), (unsigned)ch, hasBssid ? "yes" : "no");
+
+  // Optional: reuse last IP config to avoid DHCP round-trip.
+  // Only apply if we have the required fields.
+  const bool hasIpCfg = (gRtcWifiCache.ip != 0) && (gRtcWifiCache.gateway != 0) && (gRtcWifiCache.subnet != 0);
+  bool appliedStaticIp = false;
+  if (hasIpCfg) {
+    WiFi.config(IPAddress(gRtcWifiCache.ip), IPAddress(gRtcWifiCache.gateway), IPAddress(gRtcWifiCache.subnet),
+                IPAddress(gRtcWifiCache.dns1), IPAddress(gRtcWifiCache.dns2));
+    appliedStaticIp = true;
+  }
+
+  WiFi.begin(ssid.c_str(), pass.length() ? pass.c_str() : nullptr, (int32_t)ch,
+             hasBssid ? gRtcWifiCache.bssid : nullptr, true);
+
+  if (!waitForWifiConnected(timeoutMs)) {
+    Serial.println("WIFI: fast connect failed");
+
+    // IMPORTANT: WiFi.config() flips an internal WiFiSTAClass flag that disables
+    // DHCP on subsequent WiFi.begin() calls. If we tried a cached static IP and
+    // it didn't work, revert to DHCP before the next connect attempt.
+    if (appliedStaticIp) {
+      struct WiFiStaHack : public WiFiSTAClass {
+        static void setUseStaticIp(bool v) { _useStaticIp = v; }
+      };
+      WiFiStaHack::setUseStaticIp(false);
+    }
+
+    return false;
+  }
+
+  Serial.printf("WIFI: connected (fast) ip=%s\n", WiFi.localIP().toString().c_str());
+  rtcWifiCacheUpdateFromCurrent();
+  return true;
+}
+
+static void wifiTask(void* /*param*/) {
+  Serial.println("WIFI: task start");
+
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoConnect(true);
+  WiFi.setAutoReconnect(true);
+
+  // Prefer fast connect with cached channel+BSSID.
+  if (tryFastConnectFromRtc(5000)) {
+    Serial.println("WIFI: fast connect OK");
+    vTaskDelete(nullptr);
+    return;
+  }
+
+  // Next: normal connect using stored credentials (scan).
+  Serial.println("WIFI: begin() using stored credentials");
+  WiFi.begin();
+  if (waitForWifiConnected(8000)) {
+    Serial.printf("WIFI: connected ip=%s\n", WiFi.localIP().toString().c_str());
+    rtcWifiCacheUpdateFromCurrent();
+    vTaskDelete(nullptr);
+    return;
+  }
+
+  // Fallback: WiFiManager portal.
+  Serial.println("WIFI: launching WiFiManager portal");
+  WiFiManager wm;
+  wm.setAPCallback(onWmApStarted);
+  // Keep portal name stable so your phone remembers it.
+  const bool ok = wm.autoConnect("ble-health-hub");
+  if (ok) {
+    Serial.printf("WIFI: WiFiManager connected ip=%s\n", WiFi.localIP().toString().c_str());
+    rtcWifiCacheUpdateFromCurrent();
+    gForceNoWifiScreen = false;
+    gOverlayDirty = true;
+  } else {
+    Serial.println("WIFI: WiFiManager failed or timed out");
+  }
+
+  vTaskDelete(nullptr);
+}
 
 static uint32_t gDemoStartMs = 0;
 
@@ -235,6 +551,70 @@ static void setLoopToLogLoading() {
 }
 
 static void drawOverlay() {
+  if (gShowNoWifi) {
+    // Full-screen static screen.
+    setupKetosisLabelColorsOnce();
+    applyPanelViewport();
+    tft.setTextDatum(TL_DATUM);
+    tft.setTextSize(1);
+    tft.fillRect(0, 0, kPanelW, kPanelH, TFT_BLACK);
+
+    // Title banner (like the HIGH KETOSIS bar, but at the top)
+    const int bannerH = 16;
+    tft.fillRect(0, 0, kPanelW, bannerH, gKetosisRed565);
+    tft.setTextColor(TFT_WHITE, gKetosisRed565);
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextSize(1);
+    tft.drawString("NO WIFI", kPanelW / 2, bannerH / 2);
+
+    // Broken Wi-Fi icon (simple arcs + slash), drawn bold for legibility.
+    const int cx = kPanelW / 2;
+    const int cy = 72;
+    const int thick = 2;
+    auto drawThickPixel = [&](int x, int y, uint16_t c) {
+      tft.fillRect(x - (thick - 1), y - (thick - 1), thick * 2 - 1, thick * 2 - 1, c);
+    };
+
+    tft.fillCircle(cx, cy, 4, TFT_WHITE);
+    auto drawArcPoints = [&](int r, float a0, float a1) {
+      const int steps = max(12, (int)(r * 3));
+      for (int i = 0; i <= steps; i++) {
+        const float t = (float)i / (float)steps;
+        const float a = a0 + (a1 - a0) * t;
+        const int x = cx + (int)lroundf(cosf(a) * (float)r);
+        const int y = cy + (int)lroundf(sinf(a) * (float)r);
+        drawThickPixel(x, y, TFT_WHITE);
+      }
+    };
+
+    // Arcs above the dot
+    drawArcPoints(14, -2.6f, -0.55f);
+    drawArcPoints(22, -2.6f, -0.55f);
+    drawArcPoints(30, -2.6f, -0.55f);
+
+    // Slash to indicate broken (thicker)
+    tft.drawLine(cx - 22, cy - 30, cx + 22, cy + 8, TFT_RED);
+    tft.drawLine(cx - 21, cy - 30, cx + 23, cy + 8, TFT_RED);
+    tft.drawLine(cx - 23, cy - 30, cx + 21, cy + 8, TFT_RED);
+    tft.drawLine(cx - 22, cy - 29, cx + 22, cy + 9, TFT_RED);
+
+    // WiFiManager setup QR (join the portal AP).
+    const int quiet = 2;
+    const int scale = 2;
+    const int qrPx = (29 + 2 * quiet) * scale;
+    const int qrX = (kPanelW - qrPx) / 2;
+    const int qrY = 120;
+    drawQrCodeFromText(gPortalQrPayload, qrX, qrY, scale, quiet);
+
+    tft.setTextDatum(TC_DATUM);
+    tft.setTextSize(1);
+    tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+    tft.drawString("Scan to setup", kPanelW / 2, qrY + qrPx + 8);
+    tft.setTextDatum(TL_DATUM);
+    drawWifiStatusDot();
+    return;
+  }
+
   // Keep it simple and legible: opaque black background.
   setupKetosisLabelColorsOnce();
   applyPanelViewport();
@@ -296,6 +676,8 @@ static void drawOverlay() {
     tft.drawString(gKetosisLabel, kPanelW / 2, barY + (barH / 2));
     tft.setTextDatum(TL_DATUM);
   }
+
+  drawWifiStatusDot();
 }
 
 static void fillTestPattern565(uint16_t* buf) {
@@ -517,6 +899,7 @@ static void setAllLayersOpacityPct(float opacityPct) {
 
 static void applyDemoStep(int step) {
   gShowLoading = false;
+  gShowNoWifi = false;
   gTopStatus = "";
 
   // Step meanings per user spec.
@@ -602,6 +985,18 @@ static void applyDemoStep(int step) {
       setLoopToLogLoading();
       break;
     }
+    case 5: {
+      // New stage: No Wi-Fi
+      gShowNoWifi = true;
+      gTopStatus = "NO WIFI";
+      gKetosisLabel = "";
+      gKetosisLabelBg = TFT_BLACK;
+      gKetosisLabelFg = TFT_WHITE;
+
+      // Hide all animation layers while this static screen is shown.
+      setAllLayersOpacityPct(0.0f);
+      break;
+    }
     default:
       break;
   }
@@ -621,14 +1016,25 @@ static void renderTask(void* /*param*/) {
       initLottie();
     }
 
+    const bool demoGate = isDemoGateActive();
+    static bool sLastDemoGate = false;
+    if (demoGate != sLastDemoGate) {
+      sLastDemoGate = demoGate;
+      Serial.printf("DEMO: gate=%s (GPIO%d=%s)\n", demoGate ? "ON" : "OFF", kDemoGateGpio,
+                    demoGate ? "LOW" : "HIGH");
+    }
+
     if (kDemoMode && gLottieReady) {
       if (gDemoStartMs == 0) {
         gDemoStartMs = now;
       }
-      static constexpr int kDemoSteps = 5;
-      static constexpr int kDemoOrder[kDemoSteps] = {4, 0, 1, 2, 3};
+      static constexpr int kDemoSteps = 6;
+      static constexpr int kDemoOrder[kDemoSteps] = {4, 5, 0, 1, 2, 3};
       const int idx = (int)(((now - gDemoStartMs) / kDemoStepMs) % kDemoSteps);
-      const int nextStep = kDemoOrder[idx];
+      int nextStep = 4;
+      if (demoGate) {
+        nextStep = (gForceNoWifiScreen ? 5 : kDemoOrder[idx]);
+      }
       if (nextStep != demoStep) {
         demoStep = nextStep;
         Serial.printf("DEMO: step=%d\n", demoStep);
@@ -637,6 +1043,16 @@ static void renderTask(void* /*param*/) {
     }
 
     if (gLottieReady) {
+      if (gShowNoWifi) {
+        // Static screen: avoid continuously overwriting it with animation pushes.
+        if (gOverlayDirty) {
+          gOverlayDirty = false;
+          drawOverlay();
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
+        continue;
+      }
+
       renderAndPushLottieFrame();
       // Throttle a bit; actual frame selection is time-based in renderAndPushLottieFrame().
       const uint32_t minFrameMs = (uint32_t)max(5.0, (1000.0 / max(1.0, gAnimFps)));
@@ -760,6 +1176,9 @@ static void renderAndPushLottieFrame() {
     gOverlayDirty = false;
     drawOverlay();
   }
+
+  // Always draw the Wi-Fi status dot last so it stays visible on top.
+  drawWifiStatusDot();
 }
 
 static void setBacklight(bool on) {
@@ -858,6 +1277,9 @@ void setup() {
 
   Serial.println();
   Serial.println("--- boot ---");
+
+  // Demo gate input (active-low). Ground GPIO5 to enable the full demo loop.
+  pinMode(kDemoGateGpio, INPUT_PULLUP);
 #if defined(BOARD_HAS_PSRAM)
   Serial.printf("psramFound()=%s, psram=%u bytes\n", psramFound() ? "true" : "false", (unsigned)ESP.getPsramSize());
 #else
@@ -866,6 +1288,7 @@ void setup() {
   Serial.printf("flash=%u bytes\n", (unsigned)ESP.getFlashChipSize());
 
   setupKetosisLabelColorsOnce();
+  updatePortalQrPayload();
 
   printDisplayConfig();
 
@@ -908,6 +1331,15 @@ void setup() {
   }
 
   initLottie();
+
+  // Start Wi-Fi connection management in the background. This allows the
+  // display/render loop to keep running while WiFiManager is active.
+  if (!gWifiTask) {
+    const uint32_t stackDepthWords = 8192;  // 32KB
+    const BaseType_t ok = xTaskCreatePinnedToCore(
+        wifiTask, "wifiTask", stackDepthWords, nullptr, 1, &gWifiTask, 0);
+    Serial.printf("wifiTask create: %s\n", (ok == pdPASS) ? "OK" : "FAIL");
+  }
 
   // Run rendering in a separate task with a larger stack to avoid loopTask
   // stack overflow.

@@ -6,6 +6,7 @@ Goal: a standalone ESP32 app that shows GK+ + pulse-ox values on a **76x284 TFT*
 
 - Current milestone: **display bring-up + animation** (full-screen Lottie playback)
 - BLE is not wired up yet.
+- Demo/test screens are gated behind a strap: **GPIO5 to GND enables demo mode**; if not grounded, the firmware shows **LOADING only**.
 
 ## Prereqs
 
@@ -134,6 +135,10 @@ These match the defaults in `esp32/include/User_Setup.h`:
 - Display `VCC` → `3V3`
 - Display `GND` → `GND`
 
+Demo gate strap:
+
+- `GPIO5` → `GND` (optional) to enable the demo loop; leave unconnected for normal boot (LOADING only).
+
 ## Known-good TFT config (76x284 narrow panel)
 
 As of 2026-03-14, the display is working reliably with a **logical 240x320 ST7789 canvas** and an explicit **76x284 viewport**.
@@ -201,9 +206,17 @@ Once the display is confirmed working:
 - Add BLE plumbing (NimBLE/Arduino) and then implement PO3 + GK+ protocols
 
 
-Ketosis Levels:
-> 9     - NOT  KETOSIS
->=6, <9 - LOW  KETOSIS
->=3, <6 - MID  KETOSIS
->=1, <3 - HIGH KETOSIS
-< 1     - !!!  KETOSIS
+
+TODO:
+- On boot, attempt to automatically connect to the GKI+ and pulse ox BLE
+    - show the loading screen during this time.
+- Add screen for Pulse Ox
+- Use real GKI levels
+    Ketosis Levels:
+    > 9     - NOT  KETOSIS
+    >=6, <9 - LOW  KETOSIS
+    >=3, <6 - MID  KETOSIS
+    >=1, <3 - HIGH KETOSIS
+    < 1     - !!!  KETOSIS
+- Connect to the ketomojo API
+- Connect to the ihealth API (if even possible)
