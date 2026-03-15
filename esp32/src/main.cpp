@@ -3,7 +3,10 @@
 
 #include <cstdint>
 #include <memory>
+#include <set>
 #include <string>
+#include <tuple>
+#include <vector>
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -32,6 +35,10 @@ static constexpr bool kInvertDisplay = false;
 static constexpr bool kSwapBytesForPushImage = true;
 static constexpr bool kSwapRedBlueInConvert = true;
 
+// Demo mode: cycles through ketosis states and toggles Lottie layer visibility.
+static constexpr bool kDemoMode = true;
+static constexpr uint32_t kDemoStepMs = 4500;
+
 // Physical visible window is 76px wide.
 static constexpr int kPanelW = 76;
 static constexpr int kPanelH = 284;
@@ -53,11 +60,51 @@ static constexpr int kOverlayH = 170;
 
 static float gGluMgDl = 110.0f;
 static float gKetMmolL = 1.2f;
+static bool gGkiOverride = false;
+static float gGkiValue = 0.0f;
+static String gKetosisLabel = "";
+static uint16_t gKetosisLabelBg = TFT_BLACK;
+static uint16_t gKetosisLabelFg = TFT_WHITE;
+
+static inline uint16_t rgb888To565(uint8_t r, uint8_t g, uint8_t b) {
+  if (kSwapRedBlueInConvert) {
+    const uint8_t tmp = r;
+    r = b;
+    b = tmp;
+  }
+  return (uint16_t)(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
+}
+
+// Colors sampled from esp32/assets/flame.lottie (fills in named layers).
+static uint16_t gKetosisBrown565 = 0;
+static uint16_t gKetosisOrange565 = 0;
+static uint16_t gKetosisYellow565 = 0;
+static uint16_t gKetosisRed565 = 0;
+
+static void setupKetosisLabelColorsOnce() {
+  static bool inited = false;
+  if (inited) return;
+  inited = true;
+
+  // Extracted via tmp/extract_lottie_colors.py
+  // Brown:  #713E27 (Logs) (darkest of the browns found in Logs)
+  // Orange: #FD7719 (Orange Container)
+  // Yellow: #FBD03F (Yellow Container)
+  // Red:    #F4383E (BigRed/SideRed/RedWhips Outline Container)
+  gKetosisBrown565 = rgb888To565(0x71, 0x3E, 0x27);
+  gKetosisOrange565 = rgb888To565(0xFD, 0x77, 0x19);
+  gKetosisYellow565 = rgb888To565(0xFB, 0xD0, 0x3F);
+  gKetosisRed565 = rgb888To565(0xF4, 0x38, 0x3E);
+}
 
 static float computeGki(float gluMgDl, float ketMmolL) {
   if (ketMmolL <= 0.0f) return 0.0f;
   const float gluMmolL = gluMgDl / 18.0f;
   return gluMmolL / ketMmolL;
+}
+
+static float getDisplayedGki() {
+  return gGkiOverride ? gGkiValue : computeGki(gGluMgDl, gKetMmolL);
 }
 
 static void applyPanelViewport();
@@ -134,10 +181,13 @@ static uint32_t gLastLottieInitAttemptMs = 0;
 static TaskHandle_t gRenderTask = nullptr;
 static bool gOverlayDirty = true;
 
+static std::vector<std::string> gLayerNames;
+
 static constexpr size_t kLottieLoopFrames = 26;
 
 static void drawOverlay() {
   // Keep it simple and legible: opaque black background.
+  setupKetosisLabelColorsOnce();
   applyPanelViewport();
   tft.setTextDatum(TL_DATUM);
   tft.setTextSize(1);
@@ -152,7 +202,7 @@ static void drawOverlay() {
     }
   }
 
-  const float gki = computeGki(gGluMgDl, gKetMmolL);
+  const float gki = getDisplayedGki();
 
   // Label + big number, three stacked blocks.
   auto drawMetric = [&](int y, const char* label, const String& value) {
@@ -169,6 +219,18 @@ static void drawOverlay() {
   drawMetric(2, "GLU", String(gGluMgDl, 0));
   drawMetric(58, "KET", String(gKetMmolL, 1));
   drawMetric(114, "GKI", String(gki, 1));
+
+  // Ketosis label bar: full width background rectangle.
+  if (gKetosisLabel.length() > 0) {
+    const int barH = 16;
+    const int barY = kOverlayH - barH;
+    tft.fillRect(0, barY, kPanelW, barH, gKetosisLabelBg);
+    tft.setTextSize(1);
+    tft.setTextColor(gKetosisLabelFg, gKetosisLabelBg);
+    tft.setTextDatum(MC_DATUM);
+    tft.drawString(gKetosisLabel, kPanelW / 2, barY + (barH / 2));
+    tft.setTextDatum(TL_DATUM);
+  }
 }
 
 static void fillTestPattern565(uint16_t* buf) {
@@ -322,17 +384,156 @@ static void initLottie() {
   showLottieStatus("RLottie: OK", TFT_GREEN);
   gLottieReady = true;
   gOverlayDirty = true;
+
+  // Cache layer names for demo-mode visibility toggles.
+  gLayerNames.clear();
+  for (const auto& info : gAnim->layers()) {
+    const std::string& name = std::get<0>(info);
+    if (!name.empty()) gLayerNames.push_back(name);
+  }
+}
+
+static void setLayerOpacityPct(const std::string& layerName, float opacityPct) {
+  if (!gAnim) return;
+
+  auto normalize = [](const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    for (char ch : s) {
+      const unsigned char uch = (unsigned char)ch;
+      if (uch <= 0x20) continue;  // drop whitespace/control
+      if (ch == '_' || ch == '-') continue;
+      if (ch >= 'A' && ch <= 'Z') out.push_back((char)(ch - 'A' + 'a'));
+      else out.push_back(ch);
+    }
+    return out;
+  };
+
+  const std::string wantNorm = normalize(layerName);
+  const std::string* resolved = nullptr;
+  for (const auto& name : gLayerNames) {
+    if (name == layerName) {
+      resolved = &name;
+      break;
+    }
+    if (normalize(name) == wantNorm) {
+      resolved = &name;
+      break;
+    }
+  }
+
+  const std::string& key = resolved ? *resolved : layerName;
+  if (!resolved) {
+    static std::set<std::string> sWarned;
+    if (sWarned.insert(layerName).second) {
+      Serial.printf("DEMO: layer not found (using raw keypath): '%s'\n", layerName.c_str());
+    }
+  }
+
+  // TrOpacity expects [0..100]
+  // Resolve from the root reliably (regardless of root container naming).
+  gAnim->setValue<rlottie::Property::TrOpacity>("**." + key, opacityPct);
+}
+
+static void setAllLayersOpacityPct(float opacityPct) {
+  if (!gAnim) return;
+  if (gLayerNames.empty()) {
+    // Fallback if layer list is empty.
+    gAnim->setValue<rlottie::Property::TrOpacity>("**", opacityPct);
+    return;
+  }
+  for (const auto& name : gLayerNames) {
+    setLayerOpacityPct(name, opacityPct);
+  }
+}
+
+static void applyDemoStep(int step) {
+  // Step meanings per user spec.
+  switch (step) {
+    case 0: {
+      gGluMgDl = 81.0f;
+      gKetMmolL = 0.3f;
+      gGkiOverride = true;
+      gGkiValue = 15.0f;
+      gKetosisLabel = "NOT KETOSIS";
+      gKetosisLabelBg = gKetosisBrown565;
+      gKetosisLabelFg = TFT_WHITE;
+
+      // Only Logs visible.
+      setAllLayersOpacityPct(0.0f);
+      setLayerOpacityPct("Logs", 100.0f);
+      break;
+    }
+    case 1: {
+      gGluMgDl = 109.0f;
+      gKetMmolL = 1.0f;
+      gGkiOverride = true;
+      gGkiValue = 6.0f;
+      gKetosisLabel = "LOW KETOSIS";
+      gKetosisLabelBg = gKetosisOrange565;
+      gKetosisLabelFg = TFT_WHITE;
+
+      // Logs + Orange Container + Yellow Container.
+      setAllLayersOpacityPct(0.0f);
+      setLayerOpacityPct("Logs", 100.0f);
+      setLayerOpacityPct("Orange Container", 100.0f);
+      setLayerOpacityPct("Yellow Container", 100.0f);
+      break;
+    }
+    case 2: {
+      gGluMgDl = 110.0f;
+      gKetMmolL = 1.2f;
+      gGkiOverride = true;
+      gGkiValue = 5.1f;
+      gKetosisLabel = "MID KETOSIS";
+      gKetosisLabelBg = gKetosisYellow565;
+      gKetosisLabelFg = TFT_BLACK;
+
+      // All visible except BigRed Container and RedWhisp.
+      setAllLayersOpacityPct(100.0f);
+      setLayerOpacityPct("BigRed Container", 0.0f);
+      setLayerOpacityPct("RedWhips Outline Container", 0.0f);
+      break;
+    }
+    case 3: {
+      gGluMgDl = 82.0f;
+      gKetMmolL = 3.6f;
+      gGkiOverride = true;
+      gGkiValue = 1.3f;
+      gKetosisLabel = "HIGH KETOSIS";
+      gKetosisLabelBg = gKetosisRed565;
+      gKetosisLabelFg = TFT_WHITE;
+
+      // All layers visible.
+      setAllLayersOpacityPct(100.0f);
+      break;
+    }
+    default:
+      break;
+  }
+
+  gOverlayDirty = true;
 }
 
 static void renderTask(void* /*param*/) {
   // RLottie's render pipeline can be stack-hungry. Running it inside Arduino's
   // default loopTask has been observed to overflow the stack on ESP32-S3.
   // This task is created with a larger stack.
+  int demoStep = -1;
   for (;;) {
     const uint32_t now = millis();
 
     if (!gLottieReady && (now - gLastLottieInitAttemptMs) > 3000) {
       initLottie();
+    }
+
+    if (kDemoMode && gLottieReady) {
+      const int nextStep = (int)((now / kDemoStepMs) % 4);
+      if (nextStep != demoStep) {
+        demoStep = nextStep;
+        Serial.printf("DEMO: step=%d\n", demoStep);
+        applyDemoStep(demoStep);
+      }
     }
 
     if (gLottieReady) {
@@ -559,6 +760,8 @@ void setup() {
   Serial.println("PSRAM not enabled (BOARD_HAS_PSRAM not defined)");
 #endif
   Serial.printf("flash=%u bytes\n", (unsigned)ESP.getFlashChipSize());
+
+  setupKetosisLabelColorsOnce();
 
   printDisplayConfig();
 

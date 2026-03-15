@@ -18,12 +18,12 @@ From the repo root:
 
 ```sh
 cd esp32
-pio run -e esp32-s3-n16r8
-pio run -e esp32-s3-n16r8 -t upload
-pio device monitor
+./pio run -e esp32-s3-n16r8
+./pio run -e esp32-s3-n16r8 -t upload
+./pio device monitor
 ```
 
-If `pio` is not on your PATH, use the default PlatformIO venv install path:
+If you prefer not to use the wrapper, use the default PlatformIO venv install path:
 
 ```sh
 ~/.platformio/penv/bin/pio run -e esp32-s3-n16r8
@@ -51,6 +51,45 @@ The generated directory is ignored in git (it is recreated during build).
 RLottie is vendored under:
 
 - `esp32/lib/rlottie`
+
+### RLottie patch (layer `TrOpacity` support)
+
+We intentionally carry a *tiny* patch against vendored RLottie.
+
+**Why this patch exists**
+
+Our demo mode needs to show/hide named Lottie layers at runtime (e.g. show only `Logs` in NOT KETOSIS, hide `RedWhips Outline Container` in MID KETOSIS).
+
+RLottie exposes a public API for this kind of thing:
+
+- `Animation::setValue<rlottie::Property::TrOpacity>("**.<LayerName>", pct)`
+
+However, in the RLottie code we vendored, layer-level transform property updates were effectively a no-op: `renderer::Layer::resolveKeyPath()` matched the keypath but contained a `//@TODO handle propery update.` and did not store/apply the value.
+
+That meant our app code could call `setValue(TrOpacity, ...)` without any visible effect.
+
+**What the patch changes**
+
+The patch wires the existing filter mechanism into `renderer::Layer`:
+
+- When a keypath fully resolves to a layer name and the property is a transform property (`TrOpacity`), RLottie stores the value in per-layer filter data.
+- `renderer::Layer::opacity()` consults that filter data if present.
+
+This keeps the behavior local to layer opacity and avoids broader changes.
+
+**Patch file**
+
+- `esp32/patches/rlottie-layer-tropacity.patch`
+
+**How to re-apply after upgrading RLottie**
+
+From repo root (after replacing `esp32/lib/rlottie` with a newer version):
+
+```sh
+git apply esp32/patches/rlottie-layer-tropacity.patch
+```
+
+If it fails to apply cleanly, the upstream RLottie code likely changed around the patched functions. Rebase the patch by making the equivalent edits, then regenerate the patch.
 
 This lets us control compilation for ESP32 (Xtensa):
 
@@ -160,3 +199,11 @@ Once the display is confirmed working:
 
 - Decide which ESP32 board variant we’re targeting (`board = ...` in `platformio.ini`)
 - Add BLE plumbing (NimBLE/Arduino) and then implement PO3 + GK+ protocols
+
+
+Ketosis Levels:
+> 9     - NOT  KETOSIS
+>=6, <9 - LOW  KETOSIS
+>=3, <6 - MID  KETOSIS
+>=1, <3 - HIGH KETOSIS
+< 1     - !!!  KETOSIS

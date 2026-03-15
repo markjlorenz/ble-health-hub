@@ -365,7 +365,8 @@ bool renderer::Layer::resolveKeyPath(LOTKeyPath &keyPath, uint32_t depth,
     if (!keyPath.skip(name())) {
         if (keyPath.fullyResolvesTo(name(), depth) &&
             transformProp(value.property())) {
-            //@TODO handle propery update.
+            if (!mFilterData) mFilterData = std::make_unique<model::FilterData>();
+            mFilterData->addValue(value);
         }
     }
     return true;

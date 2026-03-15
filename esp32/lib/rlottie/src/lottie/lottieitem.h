@@ -250,7 +250,13 @@ protected:
     inline int     frameNo() const { return mFrameNo; }
     inline float   combinedAlpha() const { return mCombinedAlpha; }
     inline bool    isStatic() const { return mLayerData->isStatic(); }
-    float opacity(int frameNo) const { return mLayerData->opacity(frameNo); }
+    float opacity(int frameNo) const
+    {
+        if (mFilterData && mFilterData->hasFilter(rlottie::Property::TrOpacity)) {
+            return mFilterData->opacity(rlottie::Property::TrOpacity, frameNo);
+        }
+        return mLayerData->opacity(frameNo);
+    }
     inline DirtyFlag flag() const { return mDirtyFlag; }
     bool             skipRendering() const
     {
@@ -261,6 +267,7 @@ protected:
     std::unique_ptr<LayerMask> mLayerMask;
     model::Layer *             mLayerData{nullptr};
     Layer *                    mParentLayer{nullptr};
+    std::unique_ptr<model::FilterData> mFilterData{nullptr};
     VMatrix                    mCombinedMatrix;
     float                      mCombinedAlpha{0.0};
     int                        mFrameNo{-1};

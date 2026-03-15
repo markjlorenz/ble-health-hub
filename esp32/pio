@@ -1,0 +1,14 @@
+#!/usr/bin/env sh
+set -e
+
+# Wrapper to make PlatformIO CLI usable even when `pio` is not on PATH.
+# PlatformIO extension installs Core into: ~/.platformio/penv/bin/pio
+PIO_BIN="${PIO:-$HOME/.platformio/penv/bin/pio}"
+
+if [ ! -x "$PIO_BIN" ]; then
+  echo "ERROR: PlatformIO CLI not found at: $PIO_BIN" >&2
+  echo "Hint: install PlatformIO Core or set PIO=/path/to/pio" >&2
+  exit 127
+fi
+
+exec "$PIO_BIN" "$@"
