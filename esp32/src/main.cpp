@@ -35,6 +35,8 @@ extern "C" {
 
 #include "generated/flame_lottie.h"
 
+#include "pulseox_demo_lvgl.h"
+
 #if __has_include(<esp_heap_caps.h>)
 #include <esp_heap_caps.h>
 #endif
@@ -59,10 +61,14 @@ static constexpr bool kSwapRedBlueInConvert = true;
 static constexpr bool kDemoMode = true;
 static constexpr uint32_t kDemoStepMs = 4500;
 
-// Demo gate: only run the full demo loop when this GPIO is grounded.
+// Demo gates (active-low): ground the pin to enable a demo.
 // Uses the internal pull-up, so leaving it floating will read HIGH (demo off).
 // Picked to avoid common strapping pins and to avoid TFT pins.
-static constexpr int kDemoGateGpio = 5;
+//
+// - GPIO5: GK+ demo cycle (familiar ketosis stages)
+// - GPIO6: Pulse Ox demo screen (LVGL)
+static constexpr int kGkDemoGateGpio = 5;
+static constexpr int kPulseOxDemoGateGpio = 6;
 
 // Physical visible window is 76px wide.
 static constexpr int kPanelW = 76;
@@ -142,7 +148,10 @@ static void getPanelAbsXY(int* outX, int* outY);
 static void* mallocFrameBuffer(size_t bytes);
 static void renderAndPushLottieFrame();
 static void drawStatusDots();
-static bool isDemoGateActive();
+static void drawPulseOxMetrics();
+static bool isGkDemoGateActive();
+static bool isPulseOxDemoGateActive();
+static bool isAnyDemoGateActive();
 static void setBleConnected(bool v);
 
 static inline uint16_t rgba8888ToRgb565(uint32_t argb) {
@@ -191,9 +200,18 @@ static inline uint16_t rgba8888ToRgb565(uint32_t argb) {
   return (uint16_t)(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
 }
 
-static bool isDemoGateActive() {
+static bool isGkDemoGateActive() {
   // LOW means the pin is grounded.
-  return digitalRead(kDemoGateGpio) == LOW;
+  return digitalRead(kGkDemoGateGpio) == LOW;
+}
+
+static bool isPulseOxDemoGateActive() {
+  // LOW means the pin is grounded.
+  return digitalRead(kPulseOxDemoGateGpio) == LOW;
+}
+
+static bool isAnyDemoGateActive() {
+  return isGkDemoGateActive() || isPulseOxDemoGateActive();
 }
 
 static volatile bool gBleConnected = false;
@@ -205,6 +223,9 @@ static char gGkWhenLocal[8] = {0};
 // needed because some stage transitions clear parts of the screen while the
 // placeholder values may remain constant.
 static volatile bool gStatusStripDirty = true;
+
+// Some screens (e.g. PulseOx demo) want the WiFi/BLE dots but not a timestamp.
+static bool gSuppressStatusTime = false;
 
 // Reserve a bottom strip for status (time + dots) so the animation never
 // overwrites it. This prevents visible flicker during the long pushImage.
@@ -230,7 +251,7 @@ static void drawStatusDots() {
   // Darker green is less distracting and reads better on this panel.
   static const uint16_t kGreen = rgb888To565(0x00, 0xA0, 0x00);
 
-  const bool demoPlaceholders = (kDemoMode && isDemoGateActive());
+  const bool demoPlaceholders = (kDemoMode && isAnyDemoGateActive());
 
   // In demo mode, show placeholder status values so the bottom strip is always
   // populated (time + connection indicators) while cycling stages.
@@ -239,9 +260,9 @@ static void drawStatusDots() {
   const bool bleUp = demoPlaceholders ? true : gBleConnected;
   const uint16_t bleC = bleUp ? kGreen : TFT_BLACK;
 
-  // Bottom status row: show time centered between dots.
-  const char* timeStr = demoPlaceholders ? "10:26" : gGkWhenLocal;
-  const bool haveTime = (timeStr && timeStr[0] != '\0');
+  // Bottom status row: show time centered between dots (unless suppressed).
+  const char* timeStr = gSuppressStatusTime ? "" : (demoPlaceholders ? "10:26" : gGkWhenLocal);
+  const bool haveTime = (!gSuppressStatusTime) && (timeStr && timeStr[0] != '\0');
 
   // Only repaint if something changed (avoids flicker from "erase then redraw").
   static bool sInited = false;
@@ -280,6 +301,217 @@ static void drawStatusDots() {
     tft.setTextDatum(TL_DATUM);
   }
   tft.endWrite();
+}
+
+// Offscreen PulseOx metrics sprite (to avoid visible clear+redraw flicker).
+static constexpr int kPulseOxMetricsH = 96;  // 3 rows @ 32px each
+static TFT_eSprite gPulseOxMetricsSprite = TFT_eSprite(&tft);
+static bool gPulseOxMetricsSpriteOk = false;
+static void initPulseOxMetricsSpriteOnce() {
+  if (gPulseOxMetricsSpriteOk) return;
+  gPulseOxMetricsSprite.setColorDepth(16);
+  gPulseOxMetricsSpriteOk = (gPulseOxMetricsSprite.createSprite(kPanelW, kPulseOxMetricsH) != nullptr);
+  if (gPulseOxMetricsSpriteOk) {
+    gPulseOxMetricsSprite.fillSprite(TFT_BLACK);
+  }
+}
+
+static void drawPulseOxMetrics() {
+  // Draw PulseOx vitals using the same TFT_eSPI styling as GK+ metrics:
+  // label (slightly gray) above value (white), left aligned.
+  float spo2 = 0.0f;
+  float hr = 0.0f;
+  float pi = 0.0f;
+  pulseox_demo_lvgl_get_readings(&spo2, &hr, &pi);
+
+  // SpO2 status thresholds.
+  // NOTE: These are demo-oriented heuristics, not medical advice.
+  static constexpr float kSpo2NormalMin = 95.0f;
+  static constexpr float kSpo2AbnormalMin = 90.0f;
+
+  int ax = 0;
+  int ay = 0;
+  getPanelAbsXY(&ax, &ay);
+
+  // Reserve bottom strip for dots.
+  const int uiH = kPanelH - kBottomStatusH;
+  const int metricsY = ay + max(0, uiH - kPulseOxMetricsH);
+
+  initPulseOxMetricsSpriteOnce();
+  TFT_eSprite* spr = gPulseOxMetricsSpriteOk ? &gPulseOxMetricsSprite : nullptr;
+
+  struct StatusBarStyle {
+    uint16_t color;
+    uint16_t textColor;
+    const char* label;
+  };
+
+  auto computeSpo2Status = [&]() -> StatusBarStyle {
+    StatusBarStyle s;
+    if (spo2 < kSpo2AbnormalMin) {
+      s.color = rgb888To565(255, 0, 0);
+      s.textColor = TFT_WHITE;
+      s.label = "DANGER";
+      return s;
+    }
+    if (spo2 < kSpo2NormalMin) {
+      s.color = rgb888To565(255, 215, 0);
+      s.textColor = TFT_BLACK;
+      s.label = "ABNORMAL";
+      return s;
+    }
+    s.color = rgb888To565(0, 140, 0);  // darker, grassier green
+    s.textColor = TFT_WHITE;
+    s.label = "NORMAL";
+    return s;
+  };
+
+  // Draw a label rotated 90deg CCW (reads bottom->top) by rasterizing the word
+  // into a tiny sprite and blitting its pixels with a CCW transform.
+  static TFT_eSprite sLabelSpr = TFT_eSprite(&tft);
+  static bool sLabelSprOk = false;
+  if (!sLabelSprOk) {
+    sLabelSpr.setColorDepth(16);
+    // Enough width for "ABNORMAL" at font size 1 (~6px/char).
+    sLabelSprOk = (sLabelSpr.createSprite(96, 16) != nullptr);
+  }
+
+  auto drawRotatedLabelCCWIntoSprite = [&](TFT_eSprite* dst, int barLeftX, int barTopY, int barW, int barH,
+                                          const char* text, uint16_t fg, uint16_t bg) {
+    if (!sLabelSprOk) return;
+
+    static constexpr int kKernPx = 2;  // slightly wider letter spacing
+
+    int len = 0;
+    while (text[len] != '\0') len++;
+    const int srcH = 8;                 // built-in font height at text size 1
+    const int srcW = min(95, max(0, (len * (6 + kKernPx)) - kKernPx));
+
+    sLabelSpr.fillSprite(bg);
+    sLabelSpr.setTextDatum(TL_DATUM);
+    sLabelSpr.setTextSize(1);
+    sLabelSpr.setTextColor(fg, bg);
+    int cx = 0;
+    for (int i = 0; i < len; i++) {
+      char cstr[2] = {text[i], 0};
+      sLabelSpr.drawString(cstr, cx, 0);
+      cx += (6 + kKernPx);
+      if (cx >= (sLabelSpr.width() - 6)) break;
+    }
+
+    const int dstW = srcH;
+    const int dstH = srcW;
+    const int dx0 = barLeftX + max(0, (barW - dstW) / 2);
+    const int dy0 = barTopY + max(0, (barH - dstH) / 2);
+
+    for (int sy = 0; sy < srcH; sy++) {
+      for (int sx = 0; sx < srcW; sx++) {
+        const uint16_t c = sLabelSpr.readPixel(sx, sy);
+        if (c == bg) continue;
+        // CCW: (sx,sy) -> (sy, srcW-1-sx)
+        const int dx = dx0 + sy;
+        const int dy = dy0 + (srcW - 1 - sx);
+        if (dx < barLeftX || dx >= (barLeftX + barW) || dy < barTopY || dy >= (barTopY + barH)) continue;
+        dst->drawPixel(dx, dy, c);
+      }
+    }
+  };
+
+  if (spr) {
+    spr->fillSprite(TFT_BLACK);
+  } else {
+    tft.startWrite();
+    tft.fillRect(ax, metricsY, kPanelW, kPulseOxMetricsH, TFT_BLACK);
+  }
+
+  // Right-side status bar (glued to the edge).
+  const int barW = 18;
+  const int barX = kPanelW - barW;
+  const int barR = 4;
+  const StatusBarStyle status = computeSpo2Status();
+
+  if (spr) {
+    spr->fillRoundRect(barX, 0, barW, kPulseOxMetricsH, barR, status.color);
+    drawRotatedLabelCCWIntoSprite(spr, barX, 0, barW, kPulseOxMetricsH, status.label, status.textColor, status.color);
+  } else {
+    tft.fillRoundRect(ax + barX, metricsY, barW, kPulseOxMetricsH, barR, status.color);
+    // Fallback: rasterize into sLabelSpr and blit pixels to the main display.
+    if (sLabelSprOk) {
+      static constexpr int kKernPx = 2;
+      int len = 0;
+      while (status.label[len] != '\0') len++;
+      const int srcH = 8;
+      const int srcW = min(95, max(0, (len * (6 + kKernPx)) - kKernPx));
+
+      sLabelSpr.fillSprite(status.color);
+      sLabelSpr.setTextDatum(TL_DATUM);
+      sLabelSpr.setTextSize(1);
+      sLabelSpr.setTextColor(status.textColor, status.color);
+      int cx = 0;
+      for (int i = 0; i < len; i++) {
+        char cstr[2] = {status.label[i], 0};
+        sLabelSpr.drawString(cstr, cx, 0);
+        cx += (6 + kKernPx);
+        if (cx >= (sLabelSpr.width() - 6)) break;
+      }
+
+      const int dstW = srcH;
+      const int dstH = srcW;
+      const int dx0 = (ax + barX) + max(0, (barW - dstW) / 2);
+      const int dy0 = metricsY + max(0, (kPulseOxMetricsH - dstH) / 2);
+
+      for (int sy = 0; sy < srcH; sy++) {
+        for (int sx = 0; sx < srcW; sx++) {
+          const uint16_t c = sLabelSpr.readPixel(sx, sy);
+          if (c == status.color) continue;
+          const int dx = dx0 + sy;
+          const int dy = dy0 + (srcW - 1 - sx);
+          if (dx < (ax + barX) || dx >= (ax + barX + barW) || dy < metricsY || dy >= (metricsY + kPulseOxMetricsH)) continue;
+          tft.drawPixel(dx, dy, c);
+        }
+      }
+    }
+  }
+
+  auto drawMetric = [&](int y, const char* label, const String& value) {
+    if (spr) {
+      spr->setTextDatum(TL_DATUM);
+      spr->setTextSize(1);
+      spr->setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+      spr->drawString(label, 2, y);
+
+      spr->setTextSize(2);
+      spr->setTextColor(TFT_WHITE, TFT_BLACK);
+      spr->drawString(value, 2, y + 14);
+    } else {
+      tft.setTextDatum(TL_DATUM);
+      tft.setTextSize(1);
+      tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+      tft.drawString(label, ax + 2, metricsY + y);
+
+      tft.setTextSize(2);
+      tft.setTextColor(TFT_WHITE, TFT_BLACK);
+      tft.drawString(value, ax + 2, metricsY + y + 14);
+    }
+  };
+
+  char buf[16];
+  snprintf(buf, sizeof(buf), "%.0f", spo2);
+  drawMetric(0, "spo2", String(buf));
+
+  snprintf(buf, sizeof(buf), "%.0f", hr);
+  drawMetric(32, "hr", String(buf));
+
+  snprintf(buf, sizeof(buf), "%.1f", pi);
+  drawMetric(64, "pi", String(buf));
+
+  if (spr) {
+    // Use the calibrated swap-bytes setting for 16-bit sprite blits.
+    tft.setSwapBytes(kSwapBytesForPushImage);
+    spr->pushSprite(ax, metricsY);
+  } else {
+    tft.endWrite();
+  }
 }
 
 static inline bool isNearWhiteRgb(uint32_t argb, uint8_t thresh) {
@@ -375,6 +607,7 @@ static TaskHandle_t gGkTask = nullptr;
 
 static bool gShowLoading = false;
 static bool gShowNoWifi = false;
+static bool gShowPulseOx = false;
 static String gTopStatus = "";
 
 // Normal (non-demo) UI control: a background task can request which visual stage
@@ -928,7 +1161,7 @@ static void gkplusTask(void* /*param*/) {
 
   // Keep trying until we decode a reading.
   for (;;) {
-    if (isDemoGateActive()) {
+    if (isAnyDemoGateActive()) {
       vTaskDelay(pdMS_TO_TICKS(500));
       continue;
     }
@@ -1028,7 +1261,7 @@ static void gkplusTask(void* /*param*/) {
     std::vector<uint8_t> cmd16;
     bool sentXfer = false;
     for (;;) {
-      if (isDemoGateActive()) break;
+      if (isAnyDemoGateActive()) break;
       if (!client->isConnected()) break;
       if (sess.gotReading) break;
 
@@ -1670,6 +1903,8 @@ static void applyUiStepVisual(int step) {
   // so RLottie setValue() calls are serialized.
   gShowLoading = false;
   gShowNoWifi = false;
+  gShowPulseOx = false;
+  gSuppressStatusTime = false;
   gLabelFxState = kLabelFxNone;
 
   switch (step) {
@@ -1751,12 +1986,25 @@ static void applyUiStepVisual(int step) {
       setAllLayersOpacityPct(0.0f);
       break;
     }
+    case 7: {
+      // Pulse Ox demo screen (LVGL).
+      gShowPulseOx = true;
+      gSuppressStatusTime = true;
+      gTopStatus = "";
+      gKetosisLabel = "";
+      gKetosisLabelBg = TFT_BLACK;
+      gKetosisLabelFg = TFT_WHITE;
+      setAllLayersOpacityPct(0.0f);
+      break;
+    }
     default:
       break;
   }
 
   gOverlayDirty = true;
   gStatusStripDirty = true;
+
+  pulseox_demo_lvgl_set_active(gShowPulseOx);
 }
 
 static void applyDemoStep(int step) {
@@ -1805,6 +2053,10 @@ static void applyDemoStep(int step) {
       // Visuals handled by applyUiStepVisual().
       break;
     }
+    case 7: {
+      // Pulse ox demo has its own visuals; metrics are drawn by LVGL.
+      break;
+    }
     default:
       break;
   }
@@ -1830,21 +2082,39 @@ static void renderTask(void* /*param*/) {
       initLottie();
     }
 
-    const bool demoGate = isDemoGateActive();
-    static bool sLastDemoGate = false;
-    if (demoGate != sLastDemoGate) {
-      sLastDemoGate = demoGate;
-      Serial.printf("DEMO: gate=%s (GPIO%d=%s)\n", demoGate ? "ON" : "OFF", kDemoGateGpio,
-                    demoGate ? "LOW" : "HIGH");
+    const bool gkGate = isGkDemoGateActive();
+    const bool pulseGate = isPulseOxDemoGateActive();
+    const bool anyGate = gkGate || pulseGate;
+    static bool sLastGkGate = false;
+    static bool sLastPulseGate = false;
+    if (gkGate != sLastGkGate || pulseGate != sLastPulseGate) {
+      sLastGkGate = gkGate;
+      sLastPulseGate = pulseGate;
+      // Reset demo timing when switching gates/modes.
+      gDemoStartMs = 0;
+      appliedStep = -1;
+      Serial.printf("DEMO: GK(GPIO%d)=%s  PulseOx(GPIO%d)=%s\n", kGkDemoGateGpio, gkGate ? "ON" : "OFF",
+                    kPulseOxDemoGateGpio, pulseGate ? "ON" : "OFF");
+    }
+
+    // PulseOx demo should run even if RLottie isn't ready.
+    // If both demo gates are grounded, PulseOx takes precedence.
+    if (kDemoMode && pulseGate) {
+      const int nextStep = (gForceNoWifiScreen ? 5 : 7);
+      if (nextStep != appliedStep) {
+        appliedStep = nextStep;
+        Serial.printf("DEMO: step=%d\n", appliedStep);
+        applyDemoStep(appliedStep);
+      }
     }
 
     if (gLottieReady) {
-      if (kDemoMode && demoGate) {
+      if (kDemoMode && anyGate && !pulseGate) {
         if (gDemoStartMs == 0) {
           gDemoStartMs = now;
         }
         static constexpr int kDemoSteps = 6;
-        // Demo cycle: Loading -> Not -> Low -> Mid -> High -> WiFi
+        // GK+ demo cycle: Loading -> Not -> Low -> Mid -> High -> WiFi
         static constexpr int kDemoOrder[kDemoSteps] = {4, 0, 1, 2, 3, 5};
         const int idx = (int)(((now - gDemoStartMs) / kDemoStepMs) % kDemoSteps);
         const int nextStep = (gForceNoWifiScreen ? 5 : kDemoOrder[idx]);
@@ -1853,6 +2123,10 @@ static void renderTask(void* /*param*/) {
           Serial.printf("DEMO: step=%d\n", appliedStep);
           applyDemoStep(appliedStep);
         }
+      } else if (kDemoMode && anyGate) {
+        // A demo gate is active, so ignore background-requested UI steps.
+        // (Otherwise normal mode would fight with demo selection and immediately
+        // override e.g. PulseOx step 7 back to LOADING step 4.)
       } else {
         // Normal mode: apply the step requested by background tasks (e.g. GK+).
         int req = 4;
@@ -1873,6 +2147,18 @@ static void renderTask(void* /*param*/) {
           applyUiStepVisual(appliedStep);
         }
       }
+    }
+
+    // Pulse Ox LVGL demo can run even if RLottie isn't ready.
+    if (gShowPulseOx) {
+      // Ensure LVGL is initialized.
+      pulseox_demo_lvgl_init(&tft, kPanelW, kPanelH, kPanelXOff, kPanelYOff, kSwapBytesForPushImage, kSwapRedBlueInConvert);
+      pulseox_demo_lvgl_pump(now);
+      // Reuse the same bottom status strip (time + WiFi/BLE dots) as GK+.
+      drawStatusDots();
+      drawPulseOxMetrics();
+      vTaskDelay(pdMS_TO_TICKS(16));
+      continue;
     }
 
     if (gLottieReady) {
@@ -2118,8 +2404,9 @@ void setup() {
   Serial.println();
   Serial.println("--- boot ---");
 
-  // Demo gate input (active-low). Ground GPIO5 to enable the full demo loop.
-  pinMode(kDemoGateGpio, INPUT_PULLUP);
+  // Demo gate inputs (active-low). Ground the pin to enable the respective demo.
+  pinMode(kGkDemoGateGpio, INPUT_PULLUP);
+  pinMode(kPulseOxDemoGateGpio, INPUT_PULLUP);
 #if defined(BOARD_HAS_PSRAM)
   Serial.printf("psramFound()=%s, psram=%u bytes\n", psramFound() ? "true" : "false", (unsigned)ESP.getPsramSize());
 #else
