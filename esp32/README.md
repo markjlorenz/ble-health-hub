@@ -2,6 +2,8 @@
 
 Goal: a standalone ESP32 app that shows GK+ + pulse-ox values on a **76x284 TFT** (via **TFT_eSPI**) and later talks BLE to the devices.
 
+![Display demo](docs/display-demo.gif)
+
 ## Status
 
 - Current milestone: **display bring-up + animation** (full-screen Lottie playback)
@@ -196,6 +198,166 @@ If you remove that line and see boot-time instability, put it back.
 
 ## Next
 
+## MyMojoHealth (Keto-Mojo) API sync (planned)
+
+Goal: after we download the latest GK+ readings (GLU/KET/GKI), upload them to the user’s MyMojoHealth cloud account.
+
+Docs:
+
+- https://keto-mojo.github.io/MyMojoHealth-public-docs/
+- https://api.us.mymojohealth.com/docs
+
+Scope: planning + documentation only (no firmware implementation yet).
+
+### What we will build
+
+We’ll add a small “cloud sync” control surface to the existing WiFiManager portal:
+
+- `Connect MyMojoHealth` (starts OAuth consent)
+- `Disconnect MyMojoHealth` (revokes + clears tokens)
+- `Sync now` (manual upload)
+- `Status` (connected/disconnected + last upload result)
+
+### User permission (how we get consent)
+
+MyMojoHealth uses **OAuth 2.0 with PKCE**.
+
+The user-consent flow will be:
+
+1) User joins the ESP32’s WiFiManager SoftAP (config portal) and opens the portal UI.
+2) User clicks `Connect MyMojoHealth`.
+3) ESP32 generates PKCE values:
+
+- `code_verifier` (random string)
+- `code_challenge = base64url(sha256(code_verifier))`
+
+4) ESP32 redirects the phone browser to the MyMojoHealth authorize endpoint:
+
+- `https://auth.us.mymojohealth.com/oauth/authorize`
+
+With query params:
+
+- `response_type=code`
+- `client_id=<client_id>`
+- `code_challenge_method=S256`
+- `code_challenge=<code_challenge>`
+- `scope=readings_create`
+- `redirect_uri=http://192.168.4.1/oauth/callback`
+
+5) The user logs in and is shown MyMojoHealth’s consent screen.
+
+This is the explicit permission step: the OAuth client configuration includes our **Terms of Service URL** and **Privacy Policy URL**, which MyMojoHealth presents on that screen.
+
+6) After approval, MyMojoHealth redirects back to our `redirect_uri` with `code=...`.
+7) ESP32 exchanges the authorization code for tokens.
+
+### Why this redirect URI strategy (ESP32-only)
+
+OAuth redirect URIs must be pre-registered. For an ESP32, the most reliable ESP-only option is to run the connect/consent flow while the phone is on the ESP32 SoftAP, because the portal IP is stable:
+
+- `http://192.168.4.1/oauth/callback`
+
+If we later want “connect” while the ESP32 is on the home LAN, we can add an additional redirect URI (still ESP-only) such as `http://ble-health-hub.local/oauth/callback` (mDNS), but the initial plan avoids that dependency.
+
+### OAuth client setup (developer steps)
+
+For sandbox testing:
+
+- Create a Sandbox Partner account and OAuth client: https://auth.staging.mymojohealth.com/partners/register
+- Enable scopes in the Partner Dashboard (minimum: `readings_create`).
+
+OAuth client settings we expect to use:
+
+- Grant types: `authorization_code`, `refresh_token`
+- Token endpoint auth method: `none` (public client) so the ESP32 doesn’t store a client secret
+- Redirect URIs: include `http://192.168.4.1/oauth/callback`
+- ToS URL + Privacy Policy URL: required for a user-facing consent experience
+
+### Token exchange / refresh / revoke
+
+Token endpoint (per docs): `POST /api/v1/oauth/token`.
+
+Important doc note: payload is **multipart/form-data** (not raw JSON).
+
+Initial exchange (authorization code):
+
+- `grant_type=authorization_code`
+- `client_id=<client_id>`
+- `redirect_uri=<redirect_uri>`
+- `scope=<scope>`
+- `code=<authorization_code>`
+- `code_verifier=<code_verifier>`
+
+Refresh:
+
+- `grant_type=refresh_token`
+- `refresh_token=<refresh_token>`
+- `client_id=<client_id>`
+- `scope=<scope>`
+
+Revoke (disconnect):
+
+- `POST /api/v1/oauth/revoke` then clear stored tokens
+
+Storage plan:
+
+- Persist only the `refresh_token` in NVS.
+- Keep `access_token` in RAM and refresh when needed.
+
+### Uploading readings
+
+We will upload via:
+
+- `POST https://api.us.mymojohealth.com/api/v1/readings`
+- `Authorization: Bearer <access_token>`
+
+Request body is a JSON array of readings. For each GK+ sync we plan to send:
+
+- Glucose
+	- `reading_type`: `glucose`
+	- `reading_unit`: `mgdl`
+	- `reading_sample_type`: `blood`
+	- `reading_value`: integer string (e.g. `"92"`)
+	- `source`: `device`
+	- `meter_type`: `gk+_meter`
+
+- Ketone
+	- `reading_type`: `ketone`
+	- `reading_unit`: `mmoll`
+	- `reading_sample_type`: `blood`
+	- `reading_value`: one-decimal string (e.g. `"0.2"`)
+	- `source`: `device`
+	- `meter_type`: `gk+_meter`
+
+- Optional: GKI (computed by this project)
+	- `reading_type`: `glucose_ketone_index`
+	- `reading_unit`: empty string (allowed by schema)
+	- `reading_value`: one-decimal string (e.g. `"25.5"`)
+	- `source`: `device_calculated_gki`
+	- `has_device_calculated_gki`: `true`
+	- `meter_type`: `gk+_meter`
+
+Common fields we’ll include:
+
+- `reading_timestamp`: ISO 8601 timestamp for the GK+ reading
+- `client_updated_at`: ISO 8601 timestamp when we upload
+- `device_id`: ESP32 identifier (e.g. Wi-Fi MAC)
+- `serial_number`: GK+ serial if/when we can read it reliably (optional)
+
+Server behavior note: duplicates are detected server-side (user + timestamp + type + value + serial number).
+
+### Basic sync behavior
+
+- On each “new readings downloaded” event, attempt upload.
+- If Wi-Fi is down, queue for later.
+- If the token is expired, refresh and retry.
+
+### Privacy expectations
+
+- No upload happens without explicit OAuth consent.
+- Provide a one-click `Disconnect` to revoke + wipe tokens.
+- Keep scopes minimal (`readings_create` only to start).
+
 ## Troubleshooting (common)
 
 - Blank screen but ESP32 is running:
@@ -218,12 +380,5 @@ TODO:
 - On boot, attempt to automatically connect to the GKI+ and pulse ox BLE
     - show the loading screen during this time.
 - Add screen for Pulse Ox
-- Use real GKI levels
-    GKI Levels:
-    > 9     - NOT  KETOSIS
-    >=6, <9 - LOW  KETOSIS
-    >=3, <6 - MID  KETOSIS
-    >=1, <3 - HIGH KETOSIS
-    < 1     - !!!  KETOSIS
-- Connect to the ketomojo API
+- Connect to the ketomojo API (MyMojoHealth) — see plan above
 - Connect to the ihealth API (if even possible)
