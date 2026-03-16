@@ -2,6 +2,10 @@
 
 Reverse-engineering notes and tooling for BLE health devices.
 
+## ESP32 display demo
+
+![ESP32 display demo](esp32/docs/display-demo.gif)
+
 ## Device docs
 
 - Pulse oximeter (PO3): [PULSE_OX_README.markdown](PULSE_OX_README.markdown)
