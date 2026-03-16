@@ -1143,7 +1143,7 @@ static void gkplusTask(void* /*param*/) {
 
           requestUiStep(stage);
           // Give the UI a bit of life: slide values in once we have real data.
-          if (!kDemoMode) {
+          if (!isAnyDemoGateActive()) {
             startOverlayReveal();
           }
           sess->gotReading = true;
