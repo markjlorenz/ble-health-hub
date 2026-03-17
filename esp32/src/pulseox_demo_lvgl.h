@@ -3,10 +3,10 @@
 #include <Arduino.h>
 #include <TFT_eSPI.h>
 
-// LVGL-based Pulse Ox demo UI.
-// - Renders a vertical 8-segment "signal" bar (bright green segments)
-// - Shows SpO2, Heart Rate, and PI numeric readouts
-// - Drives with a fake heartbeat waveform (demo only)
+// LVGL-based Pulse Ox HUD.
+// - Renders stacked circular gauges for SpO2, HR, and PI
+// - Uses an 8-bar horizontal signal meter with peak-hold marker
+// - Can run from demo values or externally supplied live readings
 
 void pulseox_demo_lvgl_init(TFT_eSPI* tft, int panel_w, int panel_h, int panel_x_off, int panel_y_off,
                             bool swap_bytes_for_push, bool swap_red_blue);

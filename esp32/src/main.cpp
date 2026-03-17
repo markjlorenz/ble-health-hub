@@ -3068,7 +3068,6 @@ static void renderTask(void* /*param*/) {
       pulseox_demo_lvgl_pump(now);
       // Reuse the same bottom status strip (time + WiFi/BLE dots) as GK+.
       drawStatusDots();
-      drawPulseOxMetrics();
       vTaskDelay(pdMS_TO_TICKS(16));
       continue;
     }

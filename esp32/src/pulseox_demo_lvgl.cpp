@@ -7,6 +7,7 @@
 #endif
 
 #include <cmath>
+#include <cstdio>
 
 namespace {
 
@@ -24,39 +25,73 @@ static int s_ui_h = 0;
 
 static lv_disp_draw_buf_t s_draw_buf;
 static lv_disp_drv_t s_disp_drv;
-
 static lv_color_t* s_buf1 = nullptr;
 static lv_color_t* s_buf2 = nullptr;
 
 static uint32_t s_last_pump_ms = 0;
-
-static lv_obj_t* s_segments[8] = {nullptr};
-static lv_color_t* s_heart_buf[8] = {nullptr};
-static int s_heart_sz = 0;
-
-static lv_obj_t* s_peak_bg = nullptr;
-static lv_obj_t* s_peak_fg = nullptr;
-static int s_meter_y = 0;
-static int s_meter_h = 0;
-static int s_peak_w = 0;
-static int s_peak_fg_x = 0;
-static int s_peak_bg_x = 0;
-
 static float s_peak_sig = 0.0f;
 static uint32_t s_peak_ms = 0;
 
 static float s_demo_spo2 = 0.0f;
 static float s_demo_hr = 0.0f;
 static float s_demo_pi = 0.0f;
+
 static bool s_live_mode = false;
 static float s_live_spo2 = 0.0f;
 static float s_live_hr = 0.0f;
 static float s_live_pi = 0.0f;
+static float s_display_spo2 = 0.0f;
+static float s_display_hr = 0.0f;
+static float s_display_pi = 0.0f;
 static int s_live_signal_level = 0;
 
-// Reserve a bottom strip for time + WiFi/BLE dots, drawn by the main UI code
-// (same as GK+). LVGL should not draw into this area.
 static constexpr int kBottomStatusH = 12;
+static constexpr int kGaugeCount = 3;
+static constexpr float kGaugeStartDeg = 140.0f;
+static constexpr float kGaugeSweepDeg = 260.0f;
+static constexpr uint32_t kGaugeAlertPulseMs = 240;
+static constexpr int kGaugeAlertPulseCount = 3;
+
+struct GaugeSpec {
+  const char* label;
+  float min_value;
+  float max_value;
+  float normal_min;
+  float normal_max;
+  int decimals;
+  uint32_t accent_rgb;
+  uint32_t accent_dim_rgb;
+};
+
+static const GaugeSpec kGaugeSpecs[kGaugeCount] = {
+    {"SpO2", 70.0f, 100.0f, 94.0f, 100.0f, 0, 0x4DE8FFu, 0x123E47u},
+    {"HR", 40.0f, 160.0f, 60.0f, 125.0f, 0, 0x95FF5Au, 0x233F19u},
+    {"PI", 0.0f, 22.0f, 0.2f, 20.0f, 1, 0xFFC04Du, 0x4A3112u},
+};
+
+struct GaugeUi {
+  lv_obj_t* card = nullptr;
+  lv_obj_t* canvas = nullptr;
+  lv_color_t* canvas_buf = nullptr;
+  lv_obj_t* label = nullptr;
+  lv_obj_t* value = nullptr;
+};
+
+static GaugeUi s_gauges[kGaugeCount];
+static bool s_gauge_out_of_range[kGaugeCount] = {false, false, false};
+static uint32_t s_gauge_alert_start_ms[kGaugeCount] = {0, 0, 0};
+static int s_gauge_canvas_size = 0;
+
+static lv_obj_t* s_signal_panel = nullptr;
+static lv_obj_t* s_signal_frame = nullptr;
+static lv_obj_t* s_signal_bars[8] = {nullptr};
+static lv_obj_t* s_signal_peak_marker = nullptr;
+static int s_signal_inner_x = 0;
+static int s_signal_inner_y = 0;
+static int s_signal_bar_w = 0;
+static int s_signal_bar_h = 0;
+static int s_signal_bar_gap = 0;
+static int s_signal_inner_w = 0;
 
 static lv_color_t make_rgb(uint8_t r, uint8_t g, uint8_t b) {
   if (s_swap_red_blue) {
@@ -67,133 +102,49 @@ static lv_color_t make_rgb(uint8_t r, uint8_t g, uint8_t b) {
   return lv_color_make(r, g, b);
 }
 
-static lv_color_t kPinkOn() { return make_rgb(0xC7, 0x15, 0x85); }   // darker pink (medium violet red)
-static lv_color_t kPinkOff() { return make_rgb(0x18, 0x00, 0x0C); }  // very dim pink
-static lv_color_t kPeakBg() { return make_rgb(0x10, 0x10, 0x10); }
-static lv_color_t kPeakFg() { return make_rgb(0xC7, 0x15, 0x85); }
-
-static void* alloc_draw_buf_bytes(size_t bytes);
-
-static void init_heart_mask(int grid, uint8_t* out /* grid*grid */) {
-  // Procedural heart based on the classic implicit equation.
-  // ((x^2 + y^2 - 1)^3 - x^2 * y^3) <= 0
-  // We apply a small scale/offset tweak so it looks good in a square.
-  const float inv = 1.0f / (float)(grid - 1);
-  for (int y = 0; y < grid; y++) {
-    for (int x = 0; x < grid; x++) {
-      float nx = (2.0f * (x * inv)) - 1.0f;   // [-1, 1]
-      float ny = 1.0f - (2.0f * (y * inv));   // [+1, -1] (up is positive)
-
-      // Tweak: slightly narrower and shifted up to form a nicer heart.
-      nx *= 1.05f;
-      ny = (ny * 1.00f) + 0.10f;
-
-      const float a = (nx * nx) + (ny * ny) - 1.0f;
-      const float f = (a * a * a) - (nx * nx * ny * ny * ny);
-      out[(y * grid) + x] = (f <= 0.0f) ? 1u : 0u;
-    }
-  }
+static lv_color_t make_rgb_u32(uint32_t rgb) {
+  return make_rgb((uint8_t)((rgb >> 16) & 0xFF), (uint8_t)((rgb >> 8) & 0xFF), (uint8_t)(rgb & 0xFF));
 }
 
-static void draw_heart_canvas(int idx, bool on) {
-  if (idx < 0 || idx >= 8) return;
-  lv_obj_t* canvas = s_segments[idx];
-  lv_color_t* buf = s_heart_buf[idx];
-  const int sz = s_heart_sz;
-  if (!canvas || !buf || sz <= 0) return;
+static lv_color_t kScreenBg() { return make_rgb(0x04, 0x09, 0x0F); }
+static lv_color_t kPanelBg() { return make_rgb(0x09, 0x14, 0x1D); }
+static lv_color_t kPanelBorder() { return make_rgb(0x18, 0x28, 0x31); }
+static lv_color_t kGaugeTrack() { return make_rgb(0x12, 0x1B, 0x24); }
+static lv_color_t kGaugeInner() { return make_rgb(0x03, 0x07, 0x0C); }
+static lv_color_t kGaugeAlertRed() { return make_rgb(0xD8, 0x1F, 0x2E); }
+static lv_color_t kNeedleWhite() { return make_rgb(0xF8, 0xFD, 0xFF); }
+static lv_color_t kNeedleBlack() { return make_rgb(0x00, 0x00, 0x00); }
+static lv_color_t kTextDim() { return make_rgb(0x92, 0xA7, 0xB3); }
+static lv_color_t kTextBright() { return make_rgb(0xF2, 0xFB, 0xFF); }
+static lv_color_t kSignalOff() { return make_rgb(0x11, 0x19, 0x22); }
+static lv_color_t kSignalOn() { return make_rgb(0x7B, 0xFF, 0x72); }
+static lv_color_t kSignalPeak() { return make_rgb(0xF8, 0xFF, 0xA0); }
 
-  // Pixel-art heart masks.
-  // - 8x8: original chunky look
-  // - 16x16/24x24: procedurally generated so it reads as an actual heart
-  static constexpr uint8_t kMask8[8] = {
-      0b01100110,
-      0b11111111,
-      0b11111111,
-      0b11111111,
-      0b01111110,
-      0b00111100,
-      0b00011000,
-      0b00000000,
-  };
+static float clamp01(float v) {
+  if (v <= 0.0f) return 0.0f;
+  if (v >= 1.0f) return 1.0f;
+  return v;
+}
 
-  const int grid = (sz >= 24) ? 24 : ((sz >= 16) ? 16 : 8);
+static float normalize_value(float value, const GaugeSpec& spec) {
+  const float span = spec.max_value - spec.min_value;
+  if (span <= 0.0f) return 0.0f;
+  return clamp01((value - spec.min_value) / span);
+}
 
-  static bool s_mask16_ready = false;
-  static uint8_t s_mask16[16 * 16];
-  static bool s_mask24_ready = false;
-  static uint8_t s_mask24[24 * 24];
+static float angle_delta_from_start(float angle_deg) {
+  float delta = angle_deg - kGaugeStartDeg;
+  while (delta < 0.0f) delta += 360.0f;
+  while (delta >= 360.0f) delta -= 360.0f;
+  return delta;
+}
 
-  if (grid == 16 && !s_mask16_ready) {
-    init_heart_mask(16, s_mask16);
-    s_mask16_ready = true;
-  }
-  if (grid == 24 && !s_mask24_ready) {
-    init_heart_mask(24, s_mask24);
-    s_mask24_ready = true;
-  }
-
-  auto mask_at = [&](int x, int y) -> bool {
-    if (grid == 24) {
-      if (x < 0 || x >= 24 || y < 0 || y >= 24) return false;
-      return s_mask24[(y * 24) + x] != 0;
-    }
-    if (grid == 16) {
-      if (x < 0 || x >= 16 || y < 0 || y >= 16) return false;
-      return s_mask16[(y * 16) + x] != 0;
-    }
-    if (x < 0 || x >= 8 || y < 0 || y >= 8) return false;
-    return ((kMask8[y] >> (7 - x)) & 1u) != 0;
-  };
-
-  auto is_outline_pixel = [&](int x, int y) -> bool {
-    if (!mask_at(x, y)) return false;
-    // Boundary pixel if any neighbor is outside the mask.
-    for (int dy = -1; dy <= 1; dy++) {
-      for (int dx = -1; dx <= 1; dx++) {
-        if (dx == 0 && dy == 0) continue;
-        if (!mask_at(x + dx, y + dy)) return true;
-      }
-    }
-    return false;
-  };
-
-  const lv_color_t bg = lv_color_hex(0x000000);
-  const lv_color_t fg = on ? kPinkOn() : kPinkOff();
-
-  // Clear to black.
-  for (int i = 0; i < sz * sz; i++) {
-    buf[i] = bg;
-  }
-
-  const int cell = max(1, sz / grid);
-  const int art_w = cell * grid;
-  const int art_h = cell * grid;
-  const int ox = max(0, (sz - art_w) / 2);
-  const int oy = max(0, (sz - art_h) / 2);
-
-  for (int y = 0; y < grid; y++) {
-    for (int x = 0; x < grid; x++) {
-      if (on) {
-        if (!mask_at(x, y)) continue;
-      } else {
-        if (!is_outline_pixel(x, y)) continue;
-      }
-      const int px0 = ox + x * cell;
-      const int py0 = oy + y * cell;
-      for (int dy = 0; dy < cell; dy++) {
-        const int py = py0 + dy;
-        if (py < 0 || py >= sz) continue;
-        lv_color_t* line = &buf[py * sz];
-        for (int dx = 0; dx < cell; dx++) {
-          const int px = px0 + dx;
-          if (px < 0 || px >= sz) continue;
-          line[px] = fg;
-        }
-      }
-    }
-  }
-
-  lv_obj_invalidate(canvas);
+static void* alloc_draw_buf_bytes(size_t bytes) {
+#if defined(MALLOC_CAP_SPIRAM)
+  void* p = heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (p) return p;
+#endif
+  return malloc(bytes);
 }
 
 static void compute_panel_abs_xy(int* out_x, int* out_y) {
@@ -203,7 +154,6 @@ static void compute_panel_abs_xy(int* out_x, int* out_y) {
     return;
   }
 
-  // Match the logic in main.cpp's getPanelAbsXY/applyPanelViewport.
   s_tft->setRotation(0);
   s_tft->resetViewport();
   const int canvas_w = (int)s_tft->width();
@@ -226,24 +176,19 @@ static void flush_cb(lv_disp_drv_t* disp, const lv_area_t* area, lv_color_t* col
   int ay = 0;
   compute_panel_abs_xy(&ax, &ay);
 
-  const int w = (area->x2 - area->x1 + 1);
-  const int h = (area->y2 - area->y1 + 1);
+  const int w = area->x2 - area->x1 + 1;
+  const int h = area->y2 - area->y1 + 1;
 
   s_tft->setSwapBytes(s_swap_bytes);
   s_tft->startWrite();
   s_tft->pushImage(ax + area->x1, ay + area->y1, w, h, (uint16_t*)color_p);
   s_tft->endWrite();
-  // Important: don't leak the LVGL swap-byte setting into subsequent draws.
-  // If left enabled, later sprite blits will have their 16-bit pixels byte-swapped
-  // and colors like red/yellow will appear incorrect.
   s_tft->setSwapBytes(false);
 
   lv_disp_flush_ready(disp);
 }
 
 static float beat_wave(float phase01) {
-  // A simple pulse-like waveform: strong systolic peak + smaller dicrotic bump.
-  // phase01 in [0..1).
   const float x1 = (phase01 - 0.12f) / 0.045f;
   const float x2 = (phase01 - 0.36f) / 0.07f;
   float v = 0.10f;
@@ -254,20 +199,190 @@ static float beat_wave(float phase01) {
   return v;
 }
 
+static void paint_dot(lv_color_t* buf, int size, int cx, int cy, int radius, lv_color_t color) {
+  if (!buf || size <= 0 || radius < 0) return;
+  for (int dy = -radius; dy <= radius; dy++) {
+    const int y = cy + dy;
+    if (y < 0 || y >= size) continue;
+    for (int dx = -radius; dx <= radius; dx++) {
+      const int x = cx + dx;
+      if (x < 0 || x >= size) continue;
+      if ((dx * dx) + (dy * dy) > (radius * radius)) continue;
+      buf[y * size + x] = color;
+    }
+  }
+}
+
+static float ease_toward(float current, float target, uint32_t dt_ms) {
+  static constexpr float kTauMs = 220.0f;
+  if (dt_ms == 0) return current;
+  const float alpha = 1.0f - expf(-(float)dt_ms / kTauMs);
+  return current + (target - current) * alpha;
+}
+
+static void ease_live_display_values(uint32_t dt_ms) {
+  s_display_spo2 = ease_toward(s_display_spo2, s_live_spo2, dt_ms);
+  s_display_hr = ease_toward(s_display_hr, s_live_hr, dt_ms);
+  s_display_pi = ease_toward(s_display_pi, s_live_pi, dt_ms);
+}
+
+static void brighten_range_band(lv_color_t* buf, int size, float start_deg, float end_deg, float inner_r, float outer_r,
+                                lv_color_t color) {
+  for (int y = 0; y < size; y++) {
+    for (int x = 0; x < size; x++) {
+      const float dx = (float)x - (float)(size / 2) + 0.5f;
+      const float dy = (float)y - (float)(size / 2) + 0.5f;
+      const float dist = sqrtf((dx * dx) + (dy * dy));
+      if (dist < inner_r || dist > outer_r) continue;
+
+      float angle_deg = atan2f(dy, dx) * 180.0f / 3.14159265f;
+      if (angle_deg < 0.0f) angle_deg += 360.0f;
+      const float delta = angle_delta_from_start(angle_deg);
+      if (delta >= start_deg && delta <= end_deg) {
+        buf[y * size + x] = color;
+      }
+    }
+  }
+}
+
+static void draw_radial_tick(lv_color_t* buf, int size, float angle_deg, int inner_r, int outer_r, lv_color_t color) {
+  const float rad = angle_deg * 3.14159265f / 180.0f;
+  const float ux = cosf(rad);
+  const float uy = sinf(rad);
+  const int cx = size / 2;
+  const int cy = size / 2;
+
+  for (int radius = inner_r; radius <= outer_r; radius++) {
+    const int x = (int)lroundf((float)cx + ux * (float)radius);
+    const int y = (int)lroundf((float)cy + uy * (float)radius);
+    paint_dot(buf, size, x, y, 1, color);
+  }
+
+  const int tip_x = (int)lroundf((float)cx + ux * (float)outer_r);
+  const int tip_y = (int)lroundf((float)cy + uy * (float)outer_r);
+  paint_dot(buf, size, tip_x, tip_y, 1, color);
+}
+
+static float gauge_alert_mix(int gauge_idx, uint32_t now_ms) {
+  if (gauge_idx < 0 || gauge_idx >= kGaugeCount) return 0.0f;
+  if (!s_gauge_out_of_range[gauge_idx]) return 0.0f;
+
+  const uint32_t elapsed = now_ms - s_gauge_alert_start_ms[gauge_idx];
+  const uint32_t total_pulse_ms = kGaugeAlertPulseMs * 2u * (uint32_t)kGaugeAlertPulseCount;
+  if (elapsed >= total_pulse_ms) {
+    return 1.0f;
+  }
+
+  const uint32_t pulse_period_ms = kGaugeAlertPulseMs * 2u;
+  const float phase = (float)(elapsed % pulse_period_ms) / (float)kGaugeAlertPulseMs;
+  if (phase <= 1.0f) {
+    return phase;
+  }
+  return 2.0f - phase;
+}
+
+static void update_gauge_alert_state(int gauge_idx, float value, uint32_t now_ms) {
+  if (gauge_idx < 0 || gauge_idx >= kGaugeCount) return;
+  const GaugeSpec& spec = kGaugeSpecs[gauge_idx];
+  const bool out_of_range = value < spec.normal_min || value > spec.normal_max;
+  if (out_of_range && !s_gauge_out_of_range[gauge_idx]) {
+    s_gauge_alert_start_ms[gauge_idx] = now_ms;
+  }
+  if (!out_of_range) {
+    s_gauge_alert_start_ms[gauge_idx] = 0;
+  }
+  s_gauge_out_of_range[gauge_idx] = out_of_range;
+}
+
+static void draw_gauge_canvas(int gauge_idx, float value, uint32_t now_ms) {
+  if (gauge_idx < 0 || gauge_idx >= kGaugeCount) return;
+  GaugeUi& gauge = s_gauges[gauge_idx];
+  if (!gauge.canvas || !gauge.canvas_buf || s_gauge_canvas_size <= 0) return;
+
+  const GaugeSpec& spec = kGaugeSpecs[gauge_idx];
+  const int size = s_gauge_canvas_size;
+  const int cx = size / 2;
+  const int cy = size / 2;
+  const float outer_r = (float)size * 0.47f;
+  const float ring_w = max(5.0f, (float)size * 0.10f);
+  const float inner_r = outer_r - ring_w;
+  const float core_r = inner_r - 4.0f;
+  const float normal_start = normalize_value(spec.normal_min, spec) * kGaugeSweepDeg;
+  const float normal_end = normalize_value(spec.normal_max, spec) * kGaugeSweepDeg;
+  const float marker_norm = normalize_value(value, spec);
+  const float marker_angle = kGaugeStartDeg + marker_norm * kGaugeSweepDeg;
+  const float marker_delta = marker_norm * kGaugeSweepDeg;
+  const bool marker_over_normal = marker_delta >= normal_start && marker_delta <= normal_end;
+
+  const lv_color_t bg = kPanelBg();
+  const lv_color_t track = kGaugeTrack();
+  const lv_color_t normal = make_rgb_u32(spec.accent_rgb);
+  const lv_opa_t mix = (lv_opa_t)lroundf(gauge_alert_mix(gauge_idx, now_ms) * 255.0f);
+  const lv_color_t inner = lv_color_mix(kGaugeAlertRed(), kGaugeInner(), mix);
+
+  for (int y = 0; y < size; y++) {
+    for (int x = 0; x < size; x++) {
+      const float dx = (float)x - (float)cx + 0.5f;
+      const float dy = (float)y - (float)cy + 0.5f;
+      const float dist = sqrtf((dx * dx) + (dy * dy));
+      lv_color_t color = bg;
+
+      if (dist <= core_r) {
+        color = inner;
+      } else if (dist <= outer_r && dist >= inner_r) {
+        float angle_deg = atan2f(dy, dx) * 180.0f / 3.14159265f;
+        if (angle_deg < 0.0f) angle_deg += 360.0f;
+        const float delta = angle_delta_from_start(angle_deg);
+        if (delta <= kGaugeSweepDeg) {
+          color = track;
+        }
+      }
+
+      gauge.canvas_buf[y * size + x] = color;
+    }
+  }
+
+  brighten_range_band(gauge.canvas_buf, size, normal_start, normal_end, inner_r, outer_r, normal);
+  draw_radial_tick(gauge.canvas_buf, size, marker_angle, (int)inner_r - 1, (int)outer_r,
+                   marker_over_normal ? kNeedleBlack() : kNeedleWhite());
+  lv_obj_invalidate(gauge.canvas);
+}
+
+static void update_gauge_labels(float spo2, float hr, float pi, uint32_t now_ms) {
+  const float values[kGaugeCount] = {spo2, hr, pi};
+  char buf[16];
+
+  for (int i = 0; i < kGaugeCount; i++) {
+    update_gauge_alert_state(i, values[i], now_ms);
+    const GaugeSpec& spec = kGaugeSpecs[i];
+    if (!s_gauges[i].value) continue;
+    if (spec.decimals == 0) {
+      snprintf(buf, sizeof(buf), "%.0f", values[i]);
+    } else {
+      snprintf(buf, sizeof(buf), "%.1f", values[i]);
+    }
+    lv_label_set_text(s_gauges[i].value, buf);
+    lv_obj_align_to(s_gauges[i].value, s_gauges[i].canvas, LV_ALIGN_CENTER, 0, 0);
+    draw_gauge_canvas(i, values[i], now_ms);
+  }
+}
+
 static void set_segment_level(int level_0_to_8) {
   const int lvl = max(0, min(8, level_0_to_8));
   for (int i = 0; i < 8; i++) {
-    const bool on = (i < lvl);
-    draw_heart_canvas(i, on);
+    if (!s_signal_bars[i]) continue;
+    const bool on = i < lvl;
+    lv_obj_set_style_bg_color(s_signal_bars[i], on ? kSignalOn() : kSignalOff(), 0);
+    lv_obj_set_style_bg_opa(s_signal_bars[i], on ? LV_OPA_COVER : LV_OPA_70, 0);
+    lv_obj_set_style_border_color(s_signal_bars[i], on ? kTextBright() : kPanelBorder(), 0);
   }
 }
 
 static void update_peak_gauge(float sig, uint32_t now_ms) {
-  // Peak-hold for 2s, then decay down.
   static constexpr uint32_t kHoldMs = 2000;
   static constexpr uint32_t kDecayMs = 1000;
-
   static uint32_t s_last_ms = 0;
+
   uint32_t dt_ms = 0;
   if (s_last_ms != 0 && now_ms >= s_last_ms) {
     dt_ms = now_ms - s_last_ms;
@@ -280,23 +395,21 @@ static void update_peak_gauge(float sig, uint32_t now_ms) {
   } else {
     const uint32_t age = now_ms - s_peak_ms;
     if (age > kHoldMs && dt_ms > 0) {
-      // Linear decay of full-scale (1.0) over kDecayMs.
       const float dec = (float)dt_ms / (float)kDecayMs;
       s_peak_sig = max(sig, max(0.0f, s_peak_sig - dec));
     }
   }
 
-  if (!s_peak_fg || s_meter_h <= 0 || s_peak_w <= 0) return;
-  const int fill_h = (int)lroundf(max(0.0f, min(1.0f, s_peak_sig)) * (float)s_meter_h);
-  const int y = s_meter_y + (s_meter_h - fill_h);
-  lv_obj_set_pos(s_peak_fg, s_peak_fg_x, y);
-  lv_obj_set_size(s_peak_fg, s_peak_w, fill_h);
+  if (!s_signal_peak_marker || s_signal_inner_w <= 0) return;
+  const int travel = max(0, s_signal_inner_w - 2);
+  const int x = s_signal_inner_x + (int)lroundf(clamp01(s_peak_sig) * (float)travel);
+  const int marker_h = max(2, s_signal_bar_h - 2);
+  const int marker_y = s_signal_inner_y + max(0, (s_signal_bar_h - marker_h) / 2);
+  lv_obj_set_size(s_signal_peak_marker, 2, marker_h);
+  lv_obj_set_pos(s_signal_peak_marker, x, marker_y);
 }
 
 static void update_demo_readings(uint32_t t_ms) {
-  // Fake, deterministic vitals.
-  // Also cycles through NORMAL/ABNORMAL/DANGER every few seconds so the
-  // right-side status bar can demonstrate all states.
   auto lerp = [](float a, float b, float t) -> float { return a + (b - a) * t; };
   auto smoothstep01 = [](float t) -> float {
     if (t <= 0.0f) return 0.0f;
@@ -326,10 +439,7 @@ static void update_demo_readings(uint32_t t_ms) {
   const float period_ms = 60000.0f / max(40.0f, hr);
   const float phase = fmodf((float)t_ms, period_ms) / period_ms;
   const float sig = beat_wave(phase);
-
   const int seg = (int)lroundf(sig * 8.0f);
-  set_segment_level(seg);
-  update_peak_gauge(sig, t_ms);
 
   const float spo20 = spo2_base[stage];
   const float spo21 = spo2_base[next_stage];
@@ -342,109 +452,157 @@ static void update_demo_readings(uint32_t t_ms) {
   s_demo_spo2 = spo2;
   s_demo_hr = hr;
   s_demo_pi = pi;
+
+  set_segment_level(seg);
+  update_peak_gauge(sig, t_ms);
+  update_gauge_labels(spo2, hr, pi, t_ms);
 }
 
-static void update_live_readings(uint32_t now_ms) {
+static void update_live_readings(uint32_t now_ms, uint32_t dt_ms) {
   const int seg = max(0, min(8, s_live_signal_level));
   const float sig = (float)seg / 8.0f;
+  ease_live_display_values(dt_ms);
   set_segment_level(seg);
   update_peak_gauge(sig, now_ms);
+  update_gauge_labels(s_display_spo2, s_display_hr, s_display_pi, now_ms);
+}
+
+static void style_panel(lv_obj_t* obj, lv_color_t border) {
+  lv_obj_clear_flag(obj, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_style_radius(obj, 8, 0);
+  lv_obj_set_style_border_width(obj, 1, 0);
+  lv_obj_set_style_border_color(obj, border, 0);
+  lv_obj_set_style_bg_color(obj, kPanelBg(), 0);
+  lv_obj_set_style_bg_opa(obj, LV_OPA_COVER, 0);
+  lv_obj_set_style_shadow_width(obj, 0, 0);
+  lv_obj_set_style_outline_width(obj, 0, 0);
+  lv_obj_set_style_pad_all(obj, 0, 0);
+}
+
+static void style_signal_panel(lv_obj_t* obj) {
+  lv_obj_clear_flag(obj, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_style_radius(obj, 6, 0);
+  lv_obj_set_style_border_width(obj, 0, 0);
+  lv_obj_set_style_bg_color(obj, kPanelBg(), 0);
+  lv_obj_set_style_bg_opa(obj, LV_OPA_COVER, 0);
+  lv_obj_set_style_shadow_width(obj, 0, 0);
+  lv_obj_set_style_outline_width(obj, 0, 0);
+  lv_obj_set_style_pad_all(obj, 0, 0);
 }
 
 static void create_ui() {
   lv_obj_t* scr = lv_scr_act();
   lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
-  lv_obj_set_style_bg_color(scr, lv_color_hex(0x000000), 0);
+  lv_obj_set_style_bg_color(scr, kScreenBg(), 0);
   lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
 
-  // Layout goals:
-  // - Meter: 8 stacked *square* segments (vertical), centered.
-  // - Vitals: GK+-style: label above value (spo2/hr/pi), all visible.
-  const int pad_x = 2;
-  const int pad_top = 2;
-  const int seg_gap = 2;
-  const int peak_gap = 2;
-  const int peak_w = 5;
+  static constexpr int kSignalPanelH = 24;
+  static constexpr int kSignalOuterGap = 4;
+  const int card_w = min(s_panel_w - 4, 72);
+  const int card_h = 72;
+  const int gauge_size = card_w - 6;
+  const int signal_panel_y = s_ui_h - kSignalPanelH - kSignalOuterGap;
+  const int gauge_area_h = max(0, signal_panel_y - 2);
+  const int gauge_gap = max(4, (gauge_area_h - (card_h * kGaugeCount)) / (kGaugeCount + 1));
+  const int start_y = gauge_gap;
+  const int card_x = (s_panel_w - card_w) / 2;
+  const int canvas_x = (card_w - gauge_size) / 2;
+  const int canvas_y = 3;
+  const int label_y = canvas_y + gauge_size - 12;
 
-  const int label_h = 10;  // unscii_8-ish
-  const int value_h = 18;  // unscii_16-ish
-  const int metric_gap = 4;
-  const int metric_h = label_h + value_h;
-  const int metrics_h = (3 * metric_h) + (2 * metric_gap);
+  s_gauge_canvas_size = gauge_size;
 
-  const int meter_area_h = max(0, s_ui_h - (pad_top + metrics_h + 6));
-  const int max_s_by_w = max(6, (s_panel_w - (pad_x * 2)));
-  const int max_s_by_h = max(6, (meter_area_h - (7 * seg_gap)) / 8);
-  const int seg_s = max(6, min(max_s_by_w, max_s_by_h));
-  s_heart_sz = seg_s;
-  const int meter_h = (8 * seg_s) + (7 * seg_gap);
-  // Keep the hearts centered; place the peak gauge just to their left.
-  const int meter_x = (s_panel_w - seg_s) / 2;
-  const int meter_y = pad_top + max(0, (meter_area_h - meter_h) / 2);
+  for (int i = 0; i < kGaugeCount; i++) {
+    GaugeUi& gauge = s_gauges[i];
+    const int y = start_y + i * (card_h + gauge_gap);
 
-  s_meter_y = meter_y;
-  s_meter_h = meter_h;
-  s_peak_w = peak_w;
+    gauge.card = lv_obj_create(scr);
+    lv_obj_set_pos(gauge.card, card_x, y);
+    lv_obj_set_size(gauge.card, card_w, card_h);
+    style_panel(gauge.card, make_rgb_u32(kGaugeSpecs[i].accent_dim_rgb));
 
-  // Peak gauge: real bar sits just left of the hearts, shadow is 1px behind it.
-  const int peak_fg_x = meter_x - peak_gap - peak_w;
-  const int peak_x0 = peak_fg_x - 1;
-  s_peak_fg_x = peak_fg_x;
-  s_peak_bg_x = peak_x0;
-  s_peak_bg = lv_obj_create(scr);
-  lv_obj_set_pos(s_peak_bg, peak_x0, meter_y);
-  lv_obj_set_size(s_peak_bg, peak_w, meter_h);
-  lv_obj_clear_flag(s_peak_bg, LV_OBJ_FLAG_SCROLLABLE);
-  lv_obj_set_style_border_width(s_peak_bg, 0, 0);
-  lv_obj_set_style_outline_width(s_peak_bg, 0, 0);
-  lv_obj_set_style_shadow_width(s_peak_bg, 0, 0);
-  lv_obj_set_style_radius(s_peak_bg, 2, 0);
-  lv_obj_set_style_pad_all(s_peak_bg, 0, 0);
-  lv_obj_set_style_bg_color(s_peak_bg, kPeakBg(), 0);
-  lv_obj_set_style_bg_opa(s_peak_bg, LV_OPA_50, 0);
+    gauge.canvas = lv_canvas_create(gauge.card);
+    lv_obj_set_pos(gauge.canvas, canvas_x, canvas_y);
+    lv_obj_set_size(gauge.canvas, gauge_size, gauge_size);
+    lv_obj_set_style_border_width(gauge.canvas, 0, 0);
+    lv_obj_set_style_bg_opa(gauge.canvas, LV_OPA_TRANSP, 0);
 
-  s_peak_fg = lv_obj_create(scr);
-  // Real bar sits 1px to the right of the shadow, closest to the hearts.
-  lv_obj_set_pos(s_peak_fg, peak_fg_x, meter_y + meter_h);
-  lv_obj_set_size(s_peak_fg, peak_w, 0);
-  lv_obj_clear_flag(s_peak_fg, LV_OBJ_FLAG_SCROLLABLE);
-  lv_obj_set_style_border_width(s_peak_fg, 0, 0);
-  lv_obj_set_style_outline_width(s_peak_fg, 0, 0);
-  lv_obj_set_style_shadow_width(s_peak_fg, 0, 0);
-  lv_obj_set_style_radius(s_peak_fg, 2, 0);
-  lv_obj_set_style_pad_all(s_peak_fg, 0, 0);
-  lv_obj_set_style_bg_color(s_peak_fg, kPeakFg(), 0);
-  lv_obj_set_style_bg_opa(s_peak_fg, LV_OPA_COVER, 0);
+    const size_t bytes = (size_t)gauge_size * (size_t)gauge_size * sizeof(lv_color_t);
+    gauge.canvas_buf = (lv_color_t*)alloc_draw_buf_bytes(bytes);
+    lv_canvas_set_buffer(gauge.canvas, gauge.canvas_buf, gauge_size, gauge_size, LV_IMG_CF_TRUE_COLOR);
 
-  for (int i = 0; i < 8; i++) {
-    // Heart segment: LVGL canvas so we can do chunky pixel-art.
-    lv_obj_t* c = lv_canvas_create(scr);
-    s_segments[i] = c;
-    lv_obj_set_size(c, seg_s, seg_s);
-    const int y = meter_y + (7 - i) * (seg_s + seg_gap);
-    lv_obj_set_pos(c, meter_x, y);
-    lv_obj_clear_flag(c, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_style_border_width(c, 0, 0);
-    lv_obj_set_style_bg_opa(c, LV_OPA_TRANSP, 0);
+    gauge.label = lv_label_create(gauge.card);
+    lv_label_set_text(gauge.label, kGaugeSpecs[i].label);
+    lv_obj_set_style_text_font(gauge.label, &lv_font_unscii_8, 0);
+    lv_obj_set_style_text_color(gauge.label, kTextDim(), 0);
+    lv_obj_set_width(gauge.label, gauge_size - 8);
+    lv_obj_set_style_text_align(gauge.label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(gauge.label, LV_ALIGN_TOP_MID, 0, label_y);
 
-    const size_t bytes = (size_t)seg_s * (size_t)seg_s * sizeof(lv_color_t);
-    s_heart_buf[i] = (lv_color_t*)alloc_draw_buf_bytes(bytes);
-    lv_canvas_set_buffer(c, s_heart_buf[i], seg_s, seg_s, LV_IMG_CF_TRUE_COLOR);
-    draw_heart_canvas(i, false);
+    gauge.value = lv_label_create(gauge.card);
+    lv_label_set_text(gauge.value, "0");
+    lv_obj_set_style_text_font(gauge.value, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(gauge.value, kTextBright(), 0);
+    lv_obj_set_size(gauge.value, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_align(gauge.value, LV_ALIGN_CENTER, 0, 0);
   }
 
-  // Vitals are drawn using TFT_eSPI in main.cpp so they match the GK+ font/style.
+  s_signal_panel = lv_obj_create(scr);
+  lv_obj_set_pos(s_signal_panel, card_x, signal_panel_y);
+  lv_obj_set_size(s_signal_panel, card_w, kSignalPanelH);
+  style_signal_panel(s_signal_panel);
 
-  // Force a full repaint on first frame.
+  const int signal_frame_x = 0;
+  const int signal_frame_y = 0;
+  const int signal_frame_w = card_w - (signal_frame_x * 2);
+  const int signal_frame_h = kSignalPanelH - (signal_frame_y * 2);
+  s_signal_frame = lv_obj_create(s_signal_panel);
+  lv_obj_set_pos(s_signal_frame, signal_frame_x, signal_frame_y);
+  lv_obj_set_size(s_signal_frame, signal_frame_w, signal_frame_h);
+  lv_obj_clear_flag(s_signal_frame, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_style_radius(s_signal_frame, 6, 0);
+  lv_obj_set_style_border_width(s_signal_frame, 0, 0);
+  lv_obj_set_style_bg_color(s_signal_frame, kPanelBg(), 0);
+  lv_obj_set_style_bg_opa(s_signal_frame, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_pad_all(s_signal_frame, 0, 0);
+  lv_obj_set_style_shadow_width(s_signal_frame, 0, 0);
+  lv_obj_set_style_outline_width(s_signal_frame, 0, 0);
+
+  s_signal_bar_gap = 2;
+  const int signal_inner_pad_x = 2;
+  const int signal_inner_pad_y = 2;
+  s_signal_inner_y = signal_inner_pad_y;
+  s_signal_bar_h = signal_frame_h - (signal_inner_pad_y * 2);
+  const int signal_inner_available_w = signal_frame_w - (signal_inner_pad_x * 2);
+  s_signal_bar_w = max(4, (signal_inner_available_w - (7 * s_signal_bar_gap)) / 8);
+  s_signal_inner_w = (8 * s_signal_bar_w) + (7 * s_signal_bar_gap);
+  s_signal_inner_x = signal_inner_pad_x + max(0, (signal_inner_available_w - s_signal_inner_w) / 2);
+
+  for (int i = 0; i < 8; i++) {
+    s_signal_bars[i] = lv_obj_create(s_signal_frame);
+    lv_obj_set_pos(s_signal_bars[i], s_signal_inner_x + i * (s_signal_bar_w + s_signal_bar_gap), s_signal_inner_y);
+    lv_obj_set_size(s_signal_bars[i], s_signal_bar_w, s_signal_bar_h);
+    lv_obj_clear_flag(s_signal_bars[i], LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_radius(s_signal_bars[i], 2, 0);
+    lv_obj_set_style_border_width(s_signal_bars[i], 1, 0);
+    lv_obj_set_style_shadow_width(s_signal_bars[i], 0, 0);
+    lv_obj_set_style_outline_width(s_signal_bars[i], 0, 0);
+  }
+
+  s_signal_peak_marker = lv_obj_create(s_signal_frame);
+  lv_obj_set_size(s_signal_peak_marker, 2, max(2, s_signal_bar_h - 2));
+  lv_obj_clear_flag(s_signal_peak_marker, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_style_radius(s_signal_peak_marker, 1, 0);
+  lv_obj_set_style_border_width(s_signal_peak_marker, 0, 0);
+  lv_obj_set_style_bg_color(s_signal_peak_marker, kSignalPeak(), 0);
+  lv_obj_set_style_bg_opa(s_signal_peak_marker, LV_OPA_COVER, 0);
+  lv_obj_set_style_shadow_width(s_signal_peak_marker, 0, 0);
+  lv_obj_set_style_outline_width(s_signal_peak_marker, 0, 0);
+
+  set_segment_level(0);
+  update_peak_gauge(0.0f, 0);
+  update_gauge_labels(0.0f, 0.0f, 0.0f, 0);
   lv_obj_invalidate(scr);
-}
-
-static void* alloc_draw_buf_bytes(size_t bytes) {
-#if defined(MALLOC_CAP_SPIRAM)
-  void* p = heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-  if (p) return p;
-#endif
-  return malloc(bytes);
 }
 
 }  // namespace
@@ -458,7 +616,6 @@ void pulseox_demo_lvgl_init(TFT_eSPI* tft, int panel_w, int panel_h, int panel_x
   s_panel_y_off = panel_y_off;
   s_swap_bytes = swap_bytes_for_push;
   s_swap_red_blue = swap_red_blue;
-
   s_ui_h = max(0, panel_h - kBottomStatusH);
 
   if (s_inited) return;
@@ -466,23 +623,19 @@ void pulseox_demo_lvgl_init(TFT_eSPI* tft, int panel_w, int panel_h, int panel_x
 
   lv_init();
 
-  // Small draw buffers; LVGL will flush in tiles.
   const uint32_t lines = 40;
   const uint32_t buf_px = (uint32_t)panel_w * (uint32_t)lines;
   const size_t buf_bytes = (size_t)buf_px * sizeof(lv_color_t);
-
   s_buf1 = (lv_color_t*)alloc_draw_buf_bytes(buf_bytes);
   s_buf2 = (lv_color_t*)alloc_draw_buf_bytes(buf_bytes);
 
   lv_disp_draw_buf_init(&s_draw_buf, s_buf1, s_buf2, buf_px);
-
   lv_disp_drv_init(&s_disp_drv);
   s_disp_drv.hor_res = panel_w;
   s_disp_drv.ver_res = s_ui_h;
   s_disp_drv.flush_cb = flush_cb;
   s_disp_drv.draw_buf = &s_draw_buf;
   s_disp_drv.full_refresh = 0;
-
   lv_disp_drv_register(&s_disp_drv);
 
   create_ui();
@@ -500,10 +653,20 @@ void pulseox_demo_lvgl_set_active(bool active) {
 
 void pulseox_demo_lvgl_set_live_mode(bool live_mode) {
   s_live_mode = live_mode;
-  if (!live_mode) {
+  if (live_mode) {
+    s_display_spo2 = s_live_spo2;
+    s_display_hr = s_live_hr;
+    s_display_pi = s_live_pi;
+  } else {
     s_live_signal_level = 0;
     s_peak_sig = 0.0f;
     s_peak_ms = 0;
+    for (int i = 0; i < kGaugeCount; i++) {
+      s_gauge_out_of_range[i] = false;
+      s_gauge_alert_start_ms[i] = 0;
+    }
+    set_segment_level(0);
+    update_peak_gauge(0.0f, millis());
   }
   if (s_active && s_inited) {
     lv_obj_invalidate(lv_scr_act());
@@ -528,7 +691,7 @@ void pulseox_demo_lvgl_pump(uint32_t now_ms) {
   }
 
   if (s_live_mode) {
-    update_live_readings(now_ms);
+    update_live_readings(now_ms, delta);
   } else {
     update_demo_readings(lv_tick_get());
   }
