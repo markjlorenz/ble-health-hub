@@ -48,6 +48,11 @@ static uint32_t s_peak_ms = 0;
 static float s_demo_spo2 = 0.0f;
 static float s_demo_hr = 0.0f;
 static float s_demo_pi = 0.0f;
+static bool s_live_mode = false;
+static float s_live_spo2 = 0.0f;
+static float s_live_hr = 0.0f;
+static float s_live_pi = 0.0f;
+static int s_live_signal_level = 0;
 
 // Reserve a bottom strip for time + WiFi/BLE dots, drawn by the main UI code
 // (same as GK+). LVGL should not draw into this area.
@@ -339,6 +344,13 @@ static void update_demo_readings(uint32_t t_ms) {
   s_demo_pi = pi;
 }
 
+static void update_live_readings(uint32_t now_ms) {
+  const int seg = max(0, min(8, s_live_signal_level));
+  const float sig = (float)seg / 8.0f;
+  set_segment_level(seg);
+  update_peak_gauge(sig, now_ms);
+}
+
 static void create_ui() {
   lv_obj_t* scr = lv_scr_act();
   lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
@@ -486,6 +498,25 @@ void pulseox_demo_lvgl_set_active(bool active) {
   }
 }
 
+void pulseox_demo_lvgl_set_live_mode(bool live_mode) {
+  s_live_mode = live_mode;
+  if (!live_mode) {
+    s_live_signal_level = 0;
+    s_peak_sig = 0.0f;
+    s_peak_ms = 0;
+  }
+  if (s_active && s_inited) {
+    lv_obj_invalidate(lv_scr_act());
+  }
+}
+
+void pulseox_demo_lvgl_set_live_readings(float spo2, float hr, float pi, int signal_level_0_to_8) {
+  s_live_spo2 = spo2;
+  s_live_hr = hr;
+  s_live_pi = pi;
+  s_live_signal_level = max(0, min(8, signal_level_0_to_8));
+}
+
 void pulseox_demo_lvgl_pump(uint32_t now_ms) {
   if (!s_active || !s_inited) return;
 
@@ -496,11 +527,22 @@ void pulseox_demo_lvgl_pump(uint32_t now_ms) {
     lv_tick_inc(delta);
   }
 
-  update_demo_readings(lv_tick_get());
+  if (s_live_mode) {
+    update_live_readings(now_ms);
+  } else {
+    update_demo_readings(lv_tick_get());
+  }
   lv_timer_handler();
 }
 
 void pulseox_demo_lvgl_get_readings(float* out_spo2, float* out_hr, float* out_pi) {
+  if (s_live_mode) {
+    if (out_spo2) *out_spo2 = s_live_spo2;
+    if (out_hr) *out_hr = s_live_hr;
+    if (out_pi) *out_pi = s_live_pi;
+    return;
+  }
+
   if (out_spo2) *out_spo2 = s_demo_spo2;
   if (out_hr) *out_hr = s_demo_hr;
   if (out_pi) *out_pi = s_demo_pi;

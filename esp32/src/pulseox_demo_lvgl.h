@@ -13,6 +13,12 @@ void pulseox_demo_lvgl_init(TFT_eSPI* tft, int panel_w, int panel_h, int panel_x
 
 void pulseox_demo_lvgl_set_active(bool active);
 
+// Switch between demo-driven values and externally supplied live values.
+void pulseox_demo_lvgl_set_live_mode(bool live_mode);
+
+// Update the latest live PulseOx readings and signal level.
+void pulseox_demo_lvgl_set_live_readings(float spo2, float hr, float pi, int signal_level_0_to_8);
+
 // Call periodically from the render task while active.
 void pulseox_demo_lvgl_pump(uint32_t now_ms);
 

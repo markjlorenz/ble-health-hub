@@ -28,6 +28,12 @@ extern "C" {
 }
 #endif
 
+#if __has_include(<esp_system.h>)
+extern "C" {
+#include <esp_system.h>
+}
+#endif
+
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
@@ -1027,6 +1033,33 @@ static void buildLatestRecords16Command(uint16_t param, std::vector<uint8_t>* ou
   out->push_back(0x7D);
 }
 
+enum TargetDeviceKind {
+  kTargetNone = 0,
+  kTargetGkPlus = 1,
+  kTargetPulseOx = 2,
+};
+
+struct BleTargetCandidate {
+  TargetDeviceKind kind = kTargetNone;
+  NimBLEAddress address{};
+  std::string name;
+  int8_t rssi = 0;
+  bool valid = false;
+};
+
+static const NimBLEUUID kPulseOxSvcUuid("56313100-504f-6e2e-6175-696a2e6d6f63");
+static const NimBLEUUID kPulseOxSvcUuidAlt("00313156-4f50-2e6e-6175-696a2e6d6f63");
+static const NimBLEUUID kPulseOxSvcUuidWireshark("636f6d2e-6a69-7561-6e2e-504f56313100");
+static uint32_t gPulseOxReconnectAllowedAtMs = 0;
+
+static bool isPulseOxReconnectCooldownActive() {
+  return (int32_t)(millis() - gPulseOxReconnectAllowedAtMs) < 0;
+}
+
+static void startPulseOxReconnectCooldown(uint32_t cooldownMs) {
+  gPulseOxReconnectAllowedAtMs = millis() + cooldownMs;
+}
+
 static bool advLooksLikeGkPlus(const NimBLEAdvertisedDevice& d) {
   // Most reliable observed filter: Service Data (AD type 0x16) with UUID 0x78ac.
   // As a fallback, accept devices whose name includes "Keto-Mojo".
@@ -1045,21 +1078,943 @@ static bool advLooksLikeGkPlus(const NimBLEAdvertisedDevice& d) {
   return false;
 }
 
-static void gkplusTask(void* /*param*/) {
-  Serial.println("GK+: task start");
+static bool advLooksLikePulseOx(const NimBLEAdvertisedDevice& d) {
+  const std::string name = d.getName();
+  if (!name.empty()) {
+    if (name.find("Pulse") != std::string::npos || name.find("Oximeter") != std::string::npos ||
+        name.find("PO3") != std::string::npos) {
+      return true;
+    }
+  }
 
-  NimBLEDevice::init("");
-  NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+  if (d.isAdvertisingService(kPulseOxSvcUuid) || d.isAdvertisingService(kPulseOxSvcUuidAlt) ||
+      d.isAdvertisingService(kPulseOxSvcUuidWireshark)) {
+    return true;
+  }
 
-  // Always start in LOADING.
-  requestUiStep(4);
+  const uint8_t serviceCount = d.getServiceUUIDCount();
+  for (uint8_t i = 0; i < serviceCount; i++) {
+    const NimBLEUUID uuid = d.getServiceUUID(i);
+    if (uuid.equals(kPulseOxSvcUuid) || uuid.equals(kPulseOxSvcUuidAlt) || uuid.equals(kPulseOxSvcUuidWireshark)) {
+      return true;
+    }
+  }
 
+  return false;
+}
+
+static TargetDeviceKind classifyAdvertisedDevice(const NimBLEAdvertisedDevice& d) {
+  if (advLooksLikePulseOx(d)) return kTargetPulseOx;
+  if (advLooksLikeGkPlus(d)) return kTargetGkPlus;
+  return kTargetNone;
+}
+
+class TargetScanCallbacks : public NimBLEScanCallbacks {
+ public:
+  explicit TargetScanCallbacks(BleTargetCandidate* out) : out_(out) {}
+
+  void onResult(const NimBLEAdvertisedDevice* advertisedDevice) override {
+    if (!out_ || !advertisedDevice || out_->valid) return;
+    const TargetDeviceKind kind = classifyAdvertisedDevice(*advertisedDevice);
+    if (kind == kTargetNone) return;
+    if (kind == kTargetPulseOx && isPulseOxReconnectCooldownActive()) return;
+
+    out_->kind = kind;
+    out_->address = advertisedDevice->getAddress();
+    out_->name = advertisedDevice->getName();
+    out_->rssi = advertisedDevice->getRSSI();
+    out_->valid = true;
+    advertisedDevice->getScan()->stop();
+  }
+
+ private:
+  BleTargetCandidate* out_ = nullptr;
+};
+
+static bool scanForSupportedTarget(NimBLEScan* scan, BleTargetCandidate* out) {
+  if (!scan || !out) return false;
+  *out = BleTargetCandidate{};
+
+  TargetScanCallbacks callbacks(out);
+  scan->clearResults();
+  scan->setScanCallbacks(&callbacks, false);
+  scan->setActiveScan(true);
+  scan->setInterval(45);
+  scan->setWindow(15);
+  scan->setDuplicateFilter(1);
+  scan->setMaxResults(0);
+  (void)scan->getResults(5000, false);
+  scan->clearResults();
+  return out->valid;
+}
+
+struct PulseOxPrompt {
+  bool valid = false;
+  uint8_t tail1 = 0;
+  uint8_t tail2 = 0;
+  bool isA006 = false;
+};
+
+struct PulseOxReassembly {
+  bool active = false;
+  uint8_t totalFragments = 0;
+  uint8_t opcode = 0;
+  bool opcodeValid = false;
+  bool havePart[8] = {false};
+  uint8_t partLen[8] = {0};
+  uint8_t parts[8][16] = {{0}};
+};
+
+struct PulseOxSession {
+  NimBLERemoteCharacteristic* writer = nullptr;
+  bool writeWithResponse = false;
+  bool handshakeRunning = false;
+  bool handshakeComplete = false;
+  bool stage5WasA006 = false;
+  uint8_t txSeq = 1;
+  bool ackSeen[256] = {false};
+  PulseOxPrompt promptByBase[256];
+  uint8_t vendorRxBuf[512] = {0};
+  size_t vendorRxLen = 0;
+  PulseOxReassembly reassembly;
+  bool identifyReady = false;
+  uint8_t identifyOpcode = 0;
+  uint8_t identifyPayload[48] = {0};
+  float lastGoodPi = 0.0f;
+  bool gotMeasurement = false;
+  bool firstMeasurement = false;
+  uint32_t lastFrameAtMs = 0;
+  float spo2 = 0.0f;
+  float hr = 0.0f;
+  float pi = 0.0f;
+  uint8_t strength = 0;
+  uint16_t wave[3] = {0, 0, 0};
+};
+
+static portMUX_TYPE gPulseOxMux = portMUX_INITIALIZER_UNLOCKED;
+static PulseOxSession* gPulseOxSession = nullptr;
+static constexpr uint8_t kPulseOxIdentifyCmd = 0xAC;
+static constexpr uint8_t kPulseOxIdentifyStage1Marker = 0xFA;
+static constexpr uint8_t kPulseOxIdentifyStage2Marker = 0xFC;
+static const uint8_t kPulseOxIdentifyFBytes[16] = {'C', 'h', '/', 'H', 'Q', '4', 'L', 'z', 'I', 't', 'Y', 'T', '4', '2', 's', '='};
+static const uint8_t kPulseOxKeyBlob16[16] = {
+    0xbf, 0x4b, 0x05, 0x11, 0x42, 0xd2, 0x70, 0xa3,
+    0x93, 0x2d, 0x2d, 0xaa, 0xcc, 0xa9, 0xbd, 0x1e,
+};
+
+static void pulseoxSetPrompt(PulseOxSession* sess, uint8_t base, uint8_t tail1, uint8_t tail2, bool isA006) {
+  if (!sess) return;
+  portENTER_CRITICAL(&gPulseOxMux);
+  sess->promptByBase[base].valid = true;
+  sess->promptByBase[base].tail1 = tail1;
+  sess->promptByBase[base].tail2 = tail2;
+  sess->promptByBase[base].isA006 = isA006;
+  portEXIT_CRITICAL(&gPulseOxMux);
+}
+
+static void pulseoxMarkAckSeen(PulseOxSession* sess, uint8_t step) {
+  if (!sess) return;
+  portENTER_CRITICAL(&gPulseOxMux);
+  sess->ackSeen[step] = true;
+  portEXIT_CRITICAL(&gPulseOxMux);
+}
+
+static void pulseoxStoreIdentifyPayload(PulseOxSession* sess, uint8_t opcode, const uint8_t payload[48]) {
+  if (!sess || !payload) return;
+  portENTER_CRITICAL(&gPulseOxMux);
+  memcpy(sess->identifyPayload, payload, 48);
+  sess->identifyOpcode = opcode;
+  sess->identifyReady = true;
+  portEXIT_CRITICAL(&gPulseOxMux);
+}
+
+static void pulseoxSetLiveMeasurement(PulseOxSession* sess, float spo2, float hr, float pi, uint8_t strength, const uint16_t wave[3]) {
+  if (!sess) return;
+  portENTER_CRITICAL(&gPulseOxMux);
+  sess->spo2 = spo2;
+  sess->hr = hr;
+  sess->pi = pi;
+  sess->strength = strength;
+  if (wave) {
+    sess->wave[0] = wave[0];
+    sess->wave[1] = wave[1];
+    sess->wave[2] = wave[2];
+  }
+  sess->gotMeasurement = true;
+  sess->firstMeasurement = true;
+  sess->lastFrameAtMs = millis();
+  portEXIT_CRITICAL(&gPulseOxMux);
+
+  pulseox_demo_lvgl_set_live_readings(spo2, hr, pi, strength);
+}
+
+static bool pulseoxConsumeAck(PulseOxSession* sess, uint8_t step) {
+  if (!sess) return false;
+  bool seen = false;
+  portENTER_CRITICAL(&gPulseOxMux);
+  seen = sess->ackSeen[step];
+  if (seen) sess->ackSeen[step] = false;
+  portEXIT_CRITICAL(&gPulseOxMux);
+  return seen;
+}
+
+static bool pulseoxWaitForAck(PulseOxSession* sess, uint8_t step, uint32_t timeoutMs) {
+  const uint32_t startMs = millis();
+  while ((millis() - startMs) < timeoutMs) {
+    if (pulseoxConsumeAck(sess, step)) return true;
+    vTaskDelay(pdMS_TO_TICKS(20));
+  }
+  return false;
+}
+
+static bool pulseoxWaitForAckAny(PulseOxSession* sess, const uint8_t* steps, size_t count, uint8_t* outStep, uint32_t timeoutMs) {
+  if (!sess || !steps || count == 0) return false;
+  const uint32_t startMs = millis();
+  while ((millis() - startMs) < timeoutMs) {
+    for (size_t i = 0; i < count; i++) {
+      if (pulseoxConsumeAck(sess, steps[i])) {
+        if (outStep) *outStep = steps[i];
+        return true;
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(20));
+  }
+  return false;
+}
+
+static bool pulseoxWaitForPrompt(PulseOxSession* sess, uint8_t base, PulseOxPrompt* out, uint32_t timeoutMs) {
+  if (!sess || !out) return false;
+  const uint32_t startMs = millis();
+  while ((millis() - startMs) < timeoutMs) {
+    bool havePrompt = false;
+    portENTER_CRITICAL(&gPulseOxMux);
+    havePrompt = sess->promptByBase[base].valid;
+    if (havePrompt) {
+      *out = sess->promptByBase[base];
+      sess->promptByBase[base].valid = false;
+    }
+    portEXIT_CRITICAL(&gPulseOxMux);
+    if (havePrompt) return true;
+    vTaskDelay(pdMS_TO_TICKS(20));
+  }
+  return false;
+}
+
+static bool pulseoxWaitForIdentifyChallenge(PulseOxSession* sess, uint8_t* outOpcode, uint8_t outPayload48[48], uint32_t timeoutMs) {
+  if (!sess || !outPayload48) return false;
+  const uint32_t startMs = millis();
+  while ((millis() - startMs) < timeoutMs) {
+    bool ready = false;
+    uint8_t opcode = 0;
+    portENTER_CRITICAL(&gPulseOxMux);
+    ready = sess->identifyReady;
+    if (ready) {
+      opcode = sess->identifyOpcode;
+      memcpy(outPayload48, sess->identifyPayload, 48);
+      sess->identifyReady = false;
+    }
+    portEXIT_CRITICAL(&gPulseOxMux);
+    if (ready) {
+      if (outOpcode) *outOpcode = opcode;
+      return true;
+    }
+    vTaskDelay(pdMS_TO_TICKS(20));
+  }
+  return false;
+}
+
+static void pulseoxFillRandomBytes(uint8_t* out, size_t len) {
+  if (!out) return;
+  size_t i = 0;
+  while (i < len) {
+    const uint32_t r = esp_random();
+    for (int j = 0; j < 4 && i < len; j++, i++) {
+      out[i] = (uint8_t)((r >> (j * 8)) & 0xFF);
+    }
+  }
+}
+
+static void pulseoxIdentifyC16(const uint8_t in16[16], uint8_t out16[16]) {
+  for (int i = 0; i < 4; i++) {
+    out16[i] = in16[3 - i];
+    out16[i + 4] = in16[7 - i];
+    out16[i + 8] = in16[11 - i];
+    out16[i + 12] = in16[15 - i];
+  }
+}
+
+static void pulseoxNibbleSwapBytes(const uint8_t* in, uint8_t* out, size_t len) {
+  for (size_t i = 0; i < len; i++) {
+    const uint8_t b = in[i];
+    out[i] = (uint8_t)(((b & 0x0F) << 4) | ((b & 0xF0) >> 4));
+  }
+}
+
+static void pulseoxBytesToWordsBe(const uint8_t* in, size_t len, uint32_t* outWords, size_t wordCount) {
+  for (size_t i = 0; i < wordCount; i++) {
+    const size_t off = i * 4;
+    if ((off + 3) >= len) {
+      outWords[i] = 0;
+      continue;
+    }
+    outWords[i] = ((uint32_t)in[off] << 24) | ((uint32_t)in[off + 1] << 16) | ((uint32_t)in[off + 2] << 8) |
+                  (uint32_t)in[off + 3];
+  }
+}
+
+static void pulseoxWordsToBytesBe(const uint32_t* words, size_t wordCount, uint8_t* out) {
+  for (size_t i = 0; i < wordCount; i++) {
+    const uint32_t v = words[i];
+    const size_t off = i * 4;
+    out[off] = (uint8_t)((v >> 24) & 0xFF);
+    out[off + 1] = (uint8_t)((v >> 16) & 0xFF);
+    out[off + 2] = (uint8_t)((v >> 8) & 0xFF);
+    out[off + 3] = (uint8_t)(v & 0xFF);
+  }
+}
+
+static void pulseoxXxteaEncryptBytes(const uint8_t* dataBytes, size_t dataLen, const uint8_t keyBytes16[16], uint8_t* out) {
+  if (!dataBytes || !keyBytes16 || !out) return;
+  if (dataLen < 8 || (dataLen % 4) != 0) {
+    memcpy(out, dataBytes, dataLen);
+    return;
+  }
+
+  const size_t n = dataLen / 4;
+  uint32_t v[16] = {0};
+  uint32_t k[4] = {0};
+  pulseoxBytesToWordsBe(dataBytes, dataLen, v, n);
+  pulseoxBytesToWordsBe(keyBytes16, 16, k, 4);
+
+  int rounds = (int)(52 / n) + 6;
+  const uint32_t delta = 1640531527u;
+  uint32_t sum = 0;
+  uint32_t z = v[n - 1];
+
+  while (rounds-- > 0) {
+    sum -= delta;
+    const uint32_t e = (sum >> 2) & 3u;
+    for (size_t p = 0; p < (n - 1); p++) {
+      const uint32_t y = v[p + 1];
+      const uint32_t mx = ((((z >> 5) ^ (y << 2)) + ((y >> 3) ^ (z << 4))) ^ ((y ^ sum) + (z ^ k[(p & 3u) ^ e])));
+      v[p] += mx;
+      z = v[p];
+    }
+    const uint32_t y0 = v[0];
+    const uint32_t mxLast = ((((z >> 5) ^ (y0 << 2)) + ((y0 >> 3) ^ (z << 4))) ^
+                             ((y0 ^ sum) + (z ^ k[((n - 1) & 3u) ^ e])));
+    v[n - 1] += mxLast;
+    z = v[n - 1];
+  }
+
+  pulseoxWordsToBytesBe(v, n, out);
+}
+
+static void pulseoxIdentifyGetKa(uint8_t out16[16]) {
+  uint8_t swappedKey[16] = {0};
+  uint8_t swappedF[16] = {0};
+  pulseoxNibbleSwapBytes(kPulseOxKeyBlob16, swappedKey, sizeof(swappedKey));
+  pulseoxNibbleSwapBytes(kPulseOxIdentifyFBytes, swappedF, sizeof(swappedF));
+  pulseoxXxteaEncryptBytes(swappedKey, sizeof(swappedKey), swappedF, out16);
+}
+
+static void pulseoxIdentifyStage1(uint8_t out18[18]) {
+  uint8_t random16[16] = {0};
+  uint8_t c16[16] = {0};
+  pulseoxFillRandomBytes(random16, sizeof(random16));
+  for (size_t i = 0; i < sizeof(random16); i++) {
+    int s = (random16[i] >= 128) ? ((int)random16[i] - 256) : (int)random16[i];
+    if (s < 0) s = -s;
+    if (s > 128) s = 128;
+    random16[i] = (uint8_t)s;
+  }
+  pulseoxIdentifyC16(random16, c16);
+  out18[0] = kPulseOxIdentifyCmd;
+  out18[1] = kPulseOxIdentifyStage1Marker;
+  memcpy(out18 + 2, c16, 16);
+}
+
+static void pulseoxIdentifyStage2(const uint8_t challenge48[48], uint8_t out18[18]) {
+  uint8_t d[16] = {0};
+  uint8_t b[16] = {0};
+  uint8_t c[16] = {0};
+  uint8_t c16[16] = {0};
+  uint8_t ka[16] = {0};
+  uint8_t t0[16] = {0};
+  uint8_t t2[16] = {0};
+  uint8_t out16[16] = {0};
+
+  memcpy(d, challenge48, 16);
+  memcpy(b, challenge48 + 16, 16);
+  memcpy(c, challenge48 + 32, 16);
+
+  pulseoxIdentifyC16(d, c16);
+  pulseoxIdentifyGetKa(ka);
+  pulseoxXxteaEncryptBytes(c16, sizeof(c16), ka, t0);
+  pulseoxIdentifyC16(b, c16);
+  pulseoxXxteaEncryptBytes(c16, sizeof(c16), t0, c16);
+  pulseoxIdentifyC16(c, c16);
+  pulseoxXxteaEncryptBytes(c16, sizeof(c16), t0, t2);
+  pulseoxIdentifyC16(t2, out16);
+
+  out18[0] = kPulseOxIdentifyCmd;
+  out18[1] = kPulseOxIdentifyStage2Marker;
+  memcpy(out18 + 2, out16, 16);
+}
+
+static void pulseoxPackageForWrite(const uint8_t* payloadBytes, size_t payloadLen, uint8_t* txSeq,
+                                   std::vector<std::vector<uint8_t>>* frames) {
+  if (!payloadBytes || payloadLen == 0 || !txSeq || !frames) return;
+  frames->clear();
+
+  uint8_t seq = *txSeq;
+  if (payloadLen <= 15) {
+    const uint8_t lenByte = (uint8_t)((payloadLen + 2) & 0xFF);
+    std::vector<uint8_t> frame(payloadLen + 5);
+    frame[0] = 0xB0;
+    frame[1] = lenByte;
+    frame[2] = 0x00;
+    frame[3] = seq;
+    frame[4] = payloadBytes[0];
+    if (payloadLen > 1) {
+      memcpy(frame.data() + 5, payloadBytes + 1, payloadLen - 1);
+    }
+    uint8_t sum = 0;
+    for (size_t i = 2; i < (frame.size() - 1); i++) {
+      sum = (uint8_t)((sum + frame[i]) & 0xFF);
+    }
+    frame[frame.size() - 1] = sum;
+    frames->push_back(frame);
+    *txSeq = (uint8_t)((seq + 2) & 0xFF);
+    return;
+  }
+
+  const uint8_t cmd = payloadBytes[0];
+  const uint8_t* rest = payloadBytes + 1;
+  const size_t restLen = payloadLen - 1;
+  const size_t numFrags = (restLen / 14) + 1;
+  const size_t lastIndex = numFrags - 1;
+  size_t offset = 0;
+
+  for (size_t fragIndex = 0; fragIndex < numFrags; fragIndex++) {
+    size_t chunkLen = 14;
+    if (fragIndex == lastIndex) {
+      chunkLen = restLen % 14;
+    }
+    std::vector<uint8_t> frame(chunkLen + 6);
+    frame[0] = 0xB0;
+    frame[1] = (uint8_t)((chunkLen + 3) & 0xFF);
+    frame[2] = (uint8_t)(((lastIndex << 4) + lastIndex - fragIndex) & 0xFF);
+    frame[3] = seq;
+    frame[4] = cmd;
+    if (chunkLen > 0) {
+      memcpy(frame.data() + 5, rest + offset, chunkLen);
+      offset += chunkLen;
+    }
+    uint8_t sum = 0;
+    for (size_t i = 2; i < (frame.size() - 1); i++) {
+      sum = (uint8_t)((sum + frame[i]) & 0xFF);
+    }
+    frame[chunkLen + 5] = sum;
+    frames->push_back(frame);
+    seq = (uint8_t)((seq + 2) & 0xFF);
+  }
+
+  *txSeq = seq;
+}
+
+static void pulseoxBuildB003(uint8_t step, uint8_t out6[6]) {
+  out6[0] = 0xB0;
+  out6[1] = 0x03;
+  out6[2] = 0xA0;
+  out6[3] = step;
+  out6[4] = 0xAC;
+  out6[5] = (uint8_t)((step + 0x4C) & 0xFF);
+}
+
+static void pulseoxBuildB004Fixed(uint8_t step, uint8_t dataByte, uint8_t out7[7]) {
+  out7[0] = 0xB0;
+  out7[1] = 0x04;
+  out7[2] = 0x00;
+  out7[3] = step;
+  out7[4] = 0xAC;
+  out7[5] = dataByte;
+  out7[6] = (uint8_t)((step + 0xAC + dataByte) & 0xFF);
+}
+
+static void pulseoxBuildB004FromPrompt(uint8_t step, uint8_t tail1, uint8_t /*tail2*/, uint8_t out7[7]) {
+  pulseoxBuildB004Fixed(step, tail1, out7);
+}
+
+static void pulseoxBuildFragmentAck(uint8_t meta, uint8_t seq, uint8_t cmd, uint8_t out6[6]) {
+  const uint8_t ackCmd = (uint8_t)((meta + 0x70) & 0xFF);
+  const uint8_t ackSeq = (uint8_t)((seq + 1) & 0xFF);
+  out6[0] = 0xB0;
+  out6[1] = 0x03;
+  out6[2] = ackCmd;
+  out6[3] = ackSeq;
+  out6[4] = cmd;
+  out6[5] = (uint8_t)((ackCmd + ackSeq + cmd) & 0xFF);
+}
+
+static bool pulseoxWriteValue(NimBLERemoteCharacteristic* writer, const uint8_t* data, size_t len, bool response, const char* label) {
+  if (!writer || !data || len == 0) return false;
+  const bool ok = writer->writeValue(data, len, response);
+  Serial.printf("PO3: TX %s (%u bytes) => %s\n", label ? label : "", (unsigned)len, ok ? "OK" : "FAIL");
+  return ok;
+}
+
+static void pulseoxVendorRxAppend(PulseOxSession* sess, const uint8_t* data, size_t len) {
+  if (!sess || !data || len == 0) return;
+  if ((sess->vendorRxLen + len) > sizeof(sess->vendorRxBuf)) {
+    sess->vendorRxLen = 0;
+  }
+  const size_t copyLen = min(len, sizeof(sess->vendorRxBuf) - sess->vendorRxLen);
+  memcpy(sess->vendorRxBuf + sess->vendorRxLen, data, copyLen);
+  sess->vendorRxLen += copyLen;
+}
+
+static void pulseoxHandleVendorFragmentFrame(PulseOxSession* sess, const uint8_t* frame, size_t frameLen) {
+  if (!sess || !frame || frameLen < 7) return;
+  const uint8_t meta = frame[2];
+  const uint8_t totalFragments = (uint8_t)((meta >> 4) + 1);
+  const uint8_t reverseIndex = (uint8_t)(meta & 0x0F);
+  if (totalFragments == 0 || totalFragments > 8 || reverseIndex >= totalFragments) return;
+
+  const uint8_t fragIndex = (uint8_t)(totalFragments - reverseIndex - 1);
+  uint8_t payloadLen = 0;
+  const uint8_t* payload = nullptr;
+
+  if (!sess->reassembly.active || sess->reassembly.totalFragments != totalFragments) {
+    sess->reassembly = PulseOxReassembly{};
+    sess->reassembly.active = true;
+    sess->reassembly.totalFragments = totalFragments;
+  }
+
+  if (reverseIndex == (totalFragments - 1)) {
+    sess->reassembly.opcode = frame[5];
+    sess->reassembly.opcodeValid = true;
+    payload = frame + 6;
+    payloadLen = (uint8_t)(frameLen - 7);
+  } else {
+    payload = frame + 5;
+    payloadLen = (uint8_t)(frameLen - 6);
+  }
+
+  if (payloadLen > sizeof(sess->reassembly.parts[fragIndex])) return;
+  memcpy(sess->reassembly.parts[fragIndex], payload, payloadLen);
+  sess->reassembly.partLen[fragIndex] = payloadLen;
+  sess->reassembly.havePart[fragIndex] = true;
+
+  uint8_t ack[6] = {0};
+  pulseoxBuildFragmentAck(meta, frame[3], frame[4], ack);
+  (void)pulseoxWriteValue(sess->writer, ack, sizeof(ack), sess->writeWithResponse, "fragment ack");
+
+  if (!sess->reassembly.opcodeValid) return;
+  for (uint8_t i = 0; i < totalFragments; i++) {
+    if (!sess->reassembly.havePart[i]) return;
+  }
+
+  uint8_t assembled[64] = {0};
+  size_t assembledLen = 0;
+  for (uint8_t i = 0; i < totalFragments; i++) {
+    const uint8_t n = sess->reassembly.partLen[i];
+    if ((assembledLen + n) > sizeof(assembled)) {
+      sess->reassembly = PulseOxReassembly{};
+      return;
+    }
+    memcpy(assembled + assembledLen, sess->reassembly.parts[i], n);
+    assembledLen += n;
+  }
+
+  if (assembledLen == 48) {
+    pulseoxStoreIdentifyPayload(sess, sess->reassembly.opcode, assembled);
+  }
+
+  sess->reassembly = PulseOxReassembly{};
+}
+
+static void pulseoxVendorRxParseFrames(PulseOxSession* sess) {
+  if (!sess) return;
+  while (sess->vendorRxLen >= 2) {
+    size_t start = 0;
+    while (start < sess->vendorRxLen && sess->vendorRxBuf[start] != 0xA0) start++;
+    if (start >= sess->vendorRxLen) {
+      sess->vendorRxLen = 0;
+      return;
+    }
+    if (start > 0) {
+      memmove(sess->vendorRxBuf, sess->vendorRxBuf + start, sess->vendorRxLen - start);
+      sess->vendorRxLen -= start;
+    }
+    if (sess->vendorRxLen < 2) return;
+
+    const size_t totalLen = (size_t)sess->vendorRxBuf[1] + 3u;
+    if (totalLen < 6 || totalLen > sizeof(sess->vendorRxBuf)) {
+      memmove(sess->vendorRxBuf, sess->vendorRxBuf + 1, sess->vendorRxLen - 1);
+      sess->vendorRxLen -= 1;
+      continue;
+    }
+    if (sess->vendorRxLen < totalLen) return;
+
+    uint8_t frame[128] = {0};
+    memcpy(frame, sess->vendorRxBuf, totalLen);
+    memmove(sess->vendorRxBuf, sess->vendorRxBuf + totalLen, sess->vendorRxLen - totalLen);
+    sess->vendorRxLen -= totalLen;
+
+    uint8_t sum = 0;
+    for (size_t i = 2; i < (totalLen - 1); i++) {
+      sum = (uint8_t)((sum + frame[i]) & 0xFF);
+    }
+    if (sum != frame[totalLen - 1]) continue;
+
+    const uint8_t meta = frame[2];
+    if (meta == 0x00 || meta == 0xF0 || meta >= 0xA0) continue;
+    if (frame[4] != kPulseOxIdentifyCmd) continue;
+    pulseoxHandleVendorFragmentFrame(sess, frame, totalLen);
+  }
+}
+
+struct PulseOxDecodedFrame {
+  bool ok = false;
+  bool valid = false;
+  uint8_t type = 0;
+  uint8_t seq = 0;
+  uint8_t spo2 = 0;
+  float hr = 0.0f;
+  uint8_t strength = 0;
+  float pi = 0.0f;
+  uint16_t piNum = 0;
+  uint16_t piDen = 0;
+  uint16_t wave[3] = {0, 0, 0};
+};
+
+static uint16_t pulseoxU16le(const uint8_t* data, size_t index) {
+  return (uint16_t)((uint16_t)data[index] | ((uint16_t)data[index + 1] << 8));
+}
+
+static PulseOxDecodedFrame pulseoxDecodeMeasurementFrame(PulseOxSession* sess, const uint8_t frame[20]) {
+  PulseOxDecodedFrame out;
+  if (!sess || !frame) return out;
+  if (frame[0] != 0xA0 || frame[1] != 0x11) return out;
+
+  out.type = frame[2];
+  out.seq = frame[3];
+  out.spo2 = frame[6];
+  out.hr = (float)frame[7];
+  out.strength = frame[8];
+  out.piNum = pulseoxU16le(frame, 9);
+  out.piDen = pulseoxU16le(frame, 11);
+  out.wave[0] = pulseoxU16le(frame, 13);
+  out.wave[1] = pulseoxU16le(frame, 15);
+  out.wave[2] = pulseoxU16le(frame, 17);
+
+  float pi = sess->lastGoodPi;
+  if (out.spo2 != 0 && out.hr != 0.0f && out.piDen != 0) {
+    const float candidate = roundf(((float)out.piNum / (float)out.piDen) * 1000.0f) / 10.0f;
+    if (candidate >= 0.2f && candidate <= 20.0f) {
+      sess->lastGoodPi = candidate;
+      pi = candidate;
+    }
+  }
+  out.pi = pi;
+  out.valid = !(out.strength == 0 || (out.wave[0] == 0 && out.wave[1] == 0 && out.wave[2] == 0));
+  out.ok = (out.type == 0xF0 && out.hr > 0.0f && out.hr <= 250.0f && out.spo2 >= 50 && out.spo2 <= 110 &&
+            out.strength <= 8);
+  return out;
+}
+
+static void pulseoxHandleMeasurementBytes(PulseOxSession* sess, const uint8_t* data, size_t len) {
+  if (!sess || !data || len < 20) return;
+  for (size_t pos = 0; (pos + 20) <= len; pos++) {
+    if (data[pos] != 0xA0 || data[pos + 1] != 0x11) continue;
+    PulseOxDecodedFrame decoded = pulseoxDecodeMeasurementFrame(sess, data + pos);
+    if (!decoded.ok) continue;
+    pulseoxSetLiveMeasurement(sess, (float)decoded.spo2, decoded.hr, decoded.pi, decoded.strength, decoded.wave);
+  }
+}
+
+static void pulseoxNotifyHandler(NimBLERemoteCharacteristic* /*c*/, uint8_t* data, size_t len, bool /*isNotify*/) {
+  PulseOxSession* sess = gPulseOxSession;
+  if (!sess || !data || len == 0) return;
+
+  if (sess->handshakeRunning && !sess->handshakeComplete) {
+    pulseoxVendorRxAppend(sess, data, len);
+    pulseoxVendorRxParseFrames(sess);
+  }
+
+  if (len == 6 && data[0] == 0xA0 && data[1] == 0x03 && data[2] == 0xA0) {
+    pulseoxMarkAckSeen(sess, data[3]);
+  }
+
+  if (len == 7 && data[0] == 0xA0 && data[1] == 0x04 && data[2] == 0x00 && data[4] == 0xAC) {
+    pulseoxSetPrompt(sess, data[3], data[5], data[6], false);
+  }
+
+  if (len == 12 && data[0] == 0xA0 && data[1] == 0x06 && data[2] == 0x00 && data[4] == 0xAC) {
+    pulseoxSetPrompt(sess, data[3], data[5], data[6], true);
+  }
+
+  pulseoxHandleMeasurementBytes(sess, data, len);
+}
+
+static bool pulseoxRunVendorHandshake(PulseOxSession* sess) {
+  if (!sess || !sess->writer) return false;
+
+  uint8_t identify1[18] = {0};
+  std::vector<std::vector<uint8_t>> frames;
+  pulseoxIdentifyStage1(identify1);
+  pulseoxPackageForWrite(identify1, sizeof(identify1), &sess->txSeq, &frames);
+  for (const auto& frame : frames) {
+    if (!pulseoxWriteValue(sess->writer, frame.data(), frame.size(), sess->writeWithResponse, "stage1")) {
+      return false;
+    }
+    vTaskDelay(pdMS_TO_TICKS(60));
+  }
+  if (!pulseoxWaitForAck(sess, 0x04, 5000)) {
+    Serial.println("PO3: stage1 ACK timeout");
+    return false;
+  }
+
+  uint8_t challenge48[48] = {0};
+  uint8_t opcode = 0;
+  if (!pulseoxWaitForIdentifyChallenge(sess, &opcode, challenge48, 5000)) {
+    Serial.println("PO3: identify challenge timeout");
+    return false;
+  }
+
+  uint8_t identify2[18] = {0};
+  pulseoxIdentifyStage2(challenge48, identify2);
+  pulseoxPackageForWrite(identify2, sizeof(identify2), &sess->txSeq, &frames);
+  for (const auto& frame : frames) {
+    if (!pulseoxWriteValue(sess->writer, frame.data(), frame.size(), sess->writeWithResponse, "stage2")) {
+      return false;
+    }
+    vTaskDelay(pdMS_TO_TICKS(60));
+  }
+
+  uint8_t stage2Ack = 0;
+  const uint8_t stage2Steps[2] = {0x08, 0x12};
+  if (!pulseoxWaitForAckAny(sess, stage2Steps, 2, &stage2Ack, 5000)) {
+    Serial.println("PO3: stage2 ACK timeout");
+    return false;
+  }
+
+  int delta = (int)stage2Ack - 0x12;
+  if (delta > 127) delta -= 256;
+  if (delta < -127) delta += 256;
+
+  struct HandshakeStage {
+    const char* name;
+    uint8_t completeAckStep;
+    uint8_t promptBase;
+    uint8_t b004Data;
+    bool allowPrompt;
+  };
+
+  const HandshakeStage stages[] = {
+      {"stage3", (uint8_t)((0x18 + delta) & 0xFF), (uint8_t)((0x14 + delta) & 0xFF), 0xC1, true},
+      {"stage4", (uint8_t)((0x1E + delta) & 0xFF), (uint8_t)((0x1A + delta) & 0xFF), 0xC6, false},
+      {"stage5", (uint8_t)((0x24 + delta) & 0xFF), (uint8_t)((0x20 + delta) & 0xFF), 0xA5, true},
+      {"stage6", (uint8_t)((0x2C + delta) & 0xFF), 0x00, 0xA6, false},
+  };
+
+  for (const HandshakeStage& stage : stages) {
+    if (strcmp(stage.name, "stage6") != 0) {
+      const uint8_t b003Step = (uint8_t)((stage.completeAckStep - 3) & 0xFF);
+      const uint8_t b004Step = (uint8_t)((stage.completeAckStep - 1) & 0xFF);
+      uint8_t w1[6] = {0};
+      uint8_t w2[7] = {0};
+      PulseOxPrompt prompt;
+      bool havePrompt = false;
+      if (stage.allowPrompt) {
+        havePrompt = pulseoxWaitForPrompt(sess, stage.promptBase, &prompt, 400);
+      }
+
+      pulseoxBuildB003(b003Step, w1);
+      if (strcmp(stage.name, "stage5") == 0 && havePrompt && !prompt.isA006) {
+        pulseoxBuildB004FromPrompt(b004Step, prompt.tail1, prompt.tail2, w2);
+      } else {
+        if (strcmp(stage.name, "stage5") == 0) {
+          sess->stage5WasA006 = havePrompt && prompt.isA006;
+        }
+        pulseoxBuildB004Fixed(b004Step, stage.b004Data, w2);
+      }
+
+      if (!pulseoxWriteValue(sess->writer, w1, sizeof(w1), sess->writeWithResponse, stage.name)) return false;
+      vTaskDelay(pdMS_TO_TICKS(60));
+      if (!pulseoxWriteValue(sess->writer, w2, sizeof(w2), sess->writeWithResponse, stage.name)) return false;
+    } else {
+      const uint8_t promptBase26 = (uint8_t)((stage.completeAckStep - 6) & 0xFF);
+      const uint8_t promptBase28 = (uint8_t)((stage.completeAckStep - 4) & 0xFF);
+      PulseOxPrompt prompt26;
+      PulseOxPrompt prompt28;
+      (void)pulseoxWaitForPrompt(sess, promptBase26, &prompt26, 800);
+
+      uint8_t first[6] = {0};
+      pulseoxBuildB003((uint8_t)((stage.completeAckStep - 5) & 0xFF), first);
+      if (!pulseoxWriteValue(sess->writer, first, sizeof(first), sess->writeWithResponse, "stage6")) return false;
+      vTaskDelay(pdMS_TO_TICKS(60));
+
+      const bool havePrompt28 = pulseoxWaitForPrompt(sess, promptBase28, &prompt28, 200);
+      const uint8_t dataByteForB004 = havePrompt28 ? prompt28.tail1 : stage.b004Data;
+
+      uint8_t w1[6] = {0};
+      uint8_t w2[7] = {0};
+      pulseoxBuildB003((uint8_t)((stage.completeAckStep - 3) & 0xFF), w1);
+      pulseoxBuildB004Fixed((uint8_t)((stage.completeAckStep - 1) & 0xFF), dataByteForB004, w2);
+      if (!pulseoxWriteValue(sess->writer, w1, sizeof(w1), sess->writeWithResponse, "stage6")) return false;
+      vTaskDelay(pdMS_TO_TICKS(60));
+      if (!pulseoxWriteValue(sess->writer, w2, sizeof(w2), sess->writeWithResponse, "stage6")) return false;
+    }
+
+    if (!pulseoxWaitForAck(sess, stage.completeAckStep, 5000)) {
+      Serial.printf("PO3: %s ACK timeout\n", stage.name);
+      return false;
+    }
+  }
+
+  sess->handshakeRunning = false;
+  sess->handshakeComplete = true;
+  return true;
+}
+
+static bool runPulseOxSession(const BleTargetCandidate& target) {
+  static constexpr uint32_t kPulseOxInactivityDisconnectMs = 10000;
+  static constexpr uint32_t kPulseOxReconnectCooldownMs = 120000;
+
+  NimBLEClient* client = NimBLEDevice::createClient();
+  if (!client) return false;
+
+  client->setConnectTimeout(8000);
+  const bool okConn = client->connect(target.address);
+  if (!okConn) {
+    Serial.printf("PO3: connect failed err=%d\n", client->getLastError());
+    NimBLEDevice::deleteClient(client);
+    return false;
+  }
+
+  setBleConnected(true);
+  pulseox_demo_lvgl_set_live_mode(true);
+  pulseox_demo_lvgl_set_live_readings(0.0f, 0.0f, 0.0f, 0);
+  requestUiStep(7);
+  Serial.printf("PO3: connected to %s\n", target.name.empty() ? target.address.toString().c_str() : target.name.c_str());
+
+  NimBLERemoteService* svc = nullptr;
+  const NimBLEUUID serviceCandidates[] = {kPulseOxSvcUuid, kPulseOxSvcUuidAlt, kPulseOxSvcUuidWireshark};
+  for (int attempt = 1; attempt <= 4 && !svc; attempt++) {
+    for (const NimBLEUUID& uuid : serviceCandidates) {
+      svc = client->getService(uuid);
+      if (svc) break;
+    }
+    if (!svc) {
+      vTaskDelay(pdMS_TO_TICKS(250 * attempt));
+    }
+  }
+
+  if (!svc) {
+    Serial.println("PO3: vendor service not found");
+    pulseox_demo_lvgl_set_live_mode(false);
+    setBleConnected(false);
+    client->disconnect();
+    NimBLEDevice::deleteClient(client);
+    return false;
+  }
+
+  const auto& characteristics = svc->getCharacteristics(true);
+  std::vector<NimBLERemoteCharacteristic*> notifyCandidates;
+  std::vector<NimBLERemoteCharacteristic*> writeCandidates;
+  for (NimBLERemoteCharacteristic* ch : characteristics) {
+    if (!ch) continue;
+    if (ch->canNotify() || ch->canIndicate()) {
+      notifyCandidates.push_back(ch);
+    }
+    if (ch->canWriteNoResponse() || ch->canWrite()) {
+      writeCandidates.push_back(ch);
+    }
+  }
+
+  if (notifyCandidates.empty() || writeCandidates.empty()) {
+    Serial.println("PO3: missing notify/write characteristics");
+    pulseox_demo_lvgl_set_live_mode(false);
+    setBleConnected(false);
+    client->disconnect();
+    NimBLEDevice::deleteClient(client);
+    return false;
+  }
+
+  NimBLERemoteCharacteristic* writer = nullptr;
+  for (NimBLERemoteCharacteristic* ch : notifyCandidates) {
+    if (ch && (ch->canWriteNoResponse() || ch->canWrite())) {
+      writer = ch;
+      break;
+    }
+  }
+  if (!writer) {
+    writer = writeCandidates[0];
+  }
+
+  PulseOxSession sess;
+  sess.writer = writer;
+  sess.writeWithResponse = !writer->canWriteNoResponse();
+  sess.handshakeRunning = true;
+  gPulseOxSession = &sess;
+
+  bool subscribed = false;
+  for (NimBLERemoteCharacteristic* ch : notifyCandidates) {
+    if (!ch) continue;
+    if (ch->subscribe(ch->canNotify(), pulseoxNotifyHandler, true)) {
+      subscribed = true;
+      Serial.printf("PO3: subscribed %s\n", ch->getUUID().toString().c_str());
+    }
+  }
+
+  if (!subscribed) {
+    gPulseOxSession = nullptr;
+    pulseox_demo_lvgl_set_live_mode(false);
+    setBleConnected(false);
+    client->disconnect();
+    NimBLEDevice::deleteClient(client);
+    return false;
+  }
+
+  bool ok = pulseoxRunVendorHandshake(&sess);
+  if (ok) {
+    sess.lastFrameAtMs = millis();
+    Serial.println("PO3: handshake complete, waiting for live measurements");
+    while (client->isConnected()) {
+      if (isAnyDemoGateActive()) break;
+      const uint32_t idleMs = millis() - sess.lastFrameAtMs;
+      if (idleMs > kPulseOxInactivityDisconnectMs) {
+        Serial.println("PO3: no readings for 10s; disconnecting");
+        client->disconnect();
+        break;
+      }
+      if (sess.firstMeasurement && idleMs > 1500) {
+        pulseox_demo_lvgl_set_live_readings(sess.spo2, sess.hr, sess.pi, 0);
+      }
+      vTaskDelay(pdMS_TO_TICKS(100));
+    }
+  }
+
+  startPulseOxReconnectCooldown(kPulseOxReconnectCooldownMs);
+  gPulseOxSession = nullptr;
+  pulseox_demo_lvgl_set_live_mode(false);
+  setBleConnected(false);
+  client->disconnect();
+  NimBLEDevice::deleteClient(client);
+  if (!isAnyDemoGateActive()) {
+    requestUiStep(4);
+  }
+  return ok;
+}
+
+static bool runGkPlusSession(const BleTargetCandidate& target) {
   // GK+ GATT UUIDs (pcap-derived, canonical).
   const NimBLEUUID kSvc("0003cdd0-0000-1000-8000-00805f9b0131");
   const NimBLEUUID kNotify("0003cdd1-0000-1000-8000-00805f9b0131");
   const NimBLEUUID kWrite("0003cdd2-0000-1000-8000-00805f9b0131");
 
-  // Observed constant requests.
   static const uint8_t kReqInfo66[] = {0x7b, 0x01, 0x10, 0x01, 0x20, 0x66, 0x55, 0x00, 0x00, 0x01, 0x0e, 0x08, 0x08, 0x7d};
   static const uint8_t kReqInitAa[] = {0x7b, 0x01, 0x10, 0x01, 0x20, 0xaa, 0x55, 0x00, 0x00, 0x02, 0x01, 0x0d, 0x08, 0x7d};
   static const uint8_t kReqInfo77[] = {0x7b, 0x01, 0x10, 0x01, 0x20, 0x77, 0x55, 0x00, 0x00, 0x01, 0x0b, 0x0b, 0x04, 0x7d};
@@ -1076,7 +2031,6 @@ static void gkplusTask(void* /*param*/) {
     Session* sess = sSession;
     if (!sess || !data || len == 0) return;
 
-    // Split concatenated frames (0x7b..0x7d).
     size_t i = 0;
     while (i < len) {
       while (i < len && data[i] != 0x7B) i++;
@@ -1092,13 +2046,11 @@ static void gkplusTask(void* /*param*/) {
       if (flen < 12) continue;
       const uint8_t cmd = f[5];
 
-      // Records-count response: 7b 01 20 01 10 db aa 00 02 <count2> <crc4> 7d
       if (cmd == 0xDB && flen >= 16 && f[6] == 0xAA) {
         sess->gotDbCount = true;
         continue;
       }
 
-      // Record transfer frame: 7b 01 20 01 10 (16|dd|de) aa 00 09 <record9> <crc4> 7d
       if ((cmd == 0x16 || cmd == 0xDD || cmd == 0xDE) && flen >= 23 && f[6] == 0xAA && f[7] == 0x00 && f[8] == 0x09) {
         GkRecord r;
         if (!decodeGkRecordSnippet9(f + 9, 9, &r)) continue;
@@ -1109,7 +2061,6 @@ static void gkplusTask(void* /*param*/) {
           sess->raw.erase(sess->raw.begin(), sess->raw.begin() + (sess->raw.size() - 16));
         }
 
-        // Best-effort pairing: choose most recent glucose+ketone within 15 minutes.
         const int windowMin = 15;
         const GkRecord* bestG = nullptr;
         const GkRecord* bestK = nullptr;
@@ -1146,7 +2097,6 @@ static void gkplusTask(void* /*param*/) {
           portEXIT_CRITICAL(&gUiMux);
 
           requestUiStep(stage);
-          // Give the UI a bit of life: slide values in once we have real data.
           if (!isAnyDemoGateActive()) {
             startOverlayReveal();
           }
@@ -1156,151 +2106,140 @@ static void gkplusTask(void* /*param*/) {
     }
   };
 
-  // Connect loop: connect directly to a known GK+ MAC address.
-  // NOTE: This assumes the meter uses a stable public address (not a rotating
-  // resolvable private address).
-  static const char kGkPlusMac[] = "e4:33:bb:84:83:66";
-  const NimBLEAddress gkAddrPublic(std::string(kGkPlusMac), 0 /* public */);
-  const NimBLEAddress gkAddrRandom(std::string(kGkPlusMac), 1 /* random */);
+  NimBLEClient* client = NimBLEDevice::createClient();
+  if (!client) return false;
+  client->setConnectTimeout(8000);
 
-  // Keep trying until we decode a reading.
-  for (;;) {
-    if (isAnyDemoGateActive()) {
-      vTaskDelay(pdMS_TO_TICKS(500));
-      continue;
-    }
-    requestUiStep(4);
+  if (!client->connect(target.address)) {
+    Serial.printf("GK+: connect failed err=%d\n", client->getLastError());
+    NimBLEDevice::deleteClient(client);
+    return false;
+  }
 
-    // Create a fresh client each attempt.
-    Serial.printf("GK+: connect %s\n", kGkPlusMac);
+  setBleConnected(true);
+  Serial.printf("GK+: connected to %s\n", target.name.empty() ? target.address.toString().c_str() : target.name.c_str());
 
-    NimBLEClient* client = NimBLEDevice::createClient();
-    if (!client) {
-      vTaskDelay(pdMS_TO_TICKS(1000));
-      continue;
-    }
+  NimBLERemoteService* svc = client->getService(kSvc);
+  if (!svc) {
+    setBleConnected(false);
+    client->disconnect();
+    NimBLEDevice::deleteClient(client);
+    return false;
+  }
 
-    // Default is 30s; shorten so failures are less painful.
-    client->setConnectTimeout(8000);
+  NimBLERemoteCharacteristic* chNotify = svc->getCharacteristic(kNotify);
+  NimBLERemoteCharacteristic* chWrite = svc->getCharacteristic(kWrite);
+  if (!chNotify || !chWrite) {
+    setBleConnected(false);
+    client->disconnect();
+    NimBLEDevice::deleteClient(client);
+    return false;
+  }
 
-    // Some GK+ units use a stable address but advertise it as "random".
-    // Try random first, then public, with minimal logging.
-    int errRandom = 0;
-    int errPublic = 0;
-    bool okConn = client->connect(gkAddrRandom);
-    if (!okConn) {
-      errRandom = client->getLastError();
-      okConn = client->connect(gkAddrPublic);
-      if (!okConn) {
-        errPublic = client->getLastError();
-      }
-    }
+  Session sess;
+  sess.raw.reserve(8);
+  sSession = &sess;
 
-    if (!okConn) {
-      Serial.printf("GK+: connect failed (random=%d public=%d)\n", errRandom, errPublic);
-      NimBLEDevice::deleteClient(client);
-      vTaskDelay(pdMS_TO_TICKS(1000));
-      continue;
-    }
-
-    setBleConnected(true);
-    Serial.println("GK+: connected");
-
-    NimBLERemoteService* svc = client->getService(kSvc);
-    if (!svc) {
-      setBleConnected(false);
-      client->disconnect();
-      NimBLEDevice::deleteClient(client);
-      vTaskDelay(pdMS_TO_TICKS(1200));
-      continue;
-    }
-
-    NimBLERemoteCharacteristic* chNotify = svc->getCharacteristic(kNotify);
-    NimBLERemoteCharacteristic* chWrite = svc->getCharacteristic(kWrite);
-    if (!chNotify || !chWrite) {
-      setBleConnected(false);
-      client->disconnect();
-      NimBLEDevice::deleteClient(client);
-      vTaskDelay(pdMS_TO_TICKS(1200));
-      continue;
-    }
-
-    Session sess;
-    sess.raw.reserve(8);
-    sSession = &sess;
-
-    if (!chNotify->subscribe(true, onNotify)) {
-      sSession = nullptr;
-      setBleConnected(false);
-      Serial.println("GK+: subscribe failed");
-      client->disconnect();
-      NimBLEDevice::deleteClient(client);
-      vTaskDelay(pdMS_TO_TICKS(1200));
-      continue;
-    }
-
-    auto writeFrame = [&](const uint8_t* buf, size_t n, bool withResponse, const char* label) {
-      if (!buf || n == 0) return;
-      const bool ok = chWrite->writeValue(buf, n, withResponse);
-      Serial.printf("GK+: TX %s (%u bytes) => %s\n", label ? label : "", (unsigned)n, ok ? "OK" : "FAIL");
-    };
-
-    // Best-effort init sequence (from pcaps/web app). We intentionally do NOT
-    // send set-time here because the ESP32 currently has no trusted clock.
-    writeFrame(kReqInfo66, sizeof(kReqInfo66), false, "0x66");
-    vTaskDelay(pdMS_TO_TICKS(120));
-    writeFrame(kReqInitAa, sizeof(kReqInitAa), false, "0xAA");
-    vTaskDelay(pdMS_TO_TICKS(120));
-    writeFrame(kReqInfo77, sizeof(kReqInfo77), false, "0x77");
-    vTaskDelay(pdMS_TO_TICKS(120));
-    writeFrame(kReqInfo66, sizeof(kReqInfo66), false, "0x66 (again)");
-    vTaskDelay(pdMS_TO_TICKS(120));
-
-    // Request records count; the notify handler will cause us to request records.
-    writeFrame(kReqCountDb, sizeof(kReqCountDb), false, "0xDB (records count)");
-
-    Serial.println("GK+: waiting for records...");
-
-    const uint32_t t0 = millis();
-    std::vector<uint8_t> cmd16;
-    bool sentXfer = false;
-    for (;;) {
-      if (isAnyDemoGateActive()) break;
-      if (!client->isConnected()) break;
-      if (sess.gotReading) break;
-
-      const uint32_t elapsed = millis() - t0;
-      if (elapsed > 8000) {
-        Serial.println("GK+: timeout waiting for reading; retry");
-        break;
-      }
-
-      if (sess.gotDbCount && !sentXfer) {
-        sentXfer = true;
-        // For "latest complete reading" we request 2 records (glucose + ketone).
-        buildLatestRecords16Command(2, &cmd16);
-        if (!cmd16.empty()) {
-          writeFrame(cmd16.data(), cmd16.size(), false, "0x16 (latest records n=2)");
-        }
-      }
-
-      vTaskDelay(pdMS_TO_TICKS(100));
-    }
-
-    const bool okReading = sess.gotReading;
-
+  if (!chNotify->subscribe(true, onNotify)) {
     sSession = nullptr;
     setBleConnected(false);
     client->disconnect();
     NimBLEDevice::deleteClient(client);
+    return false;
+  }
 
-    if (okReading) {
-      Serial.println("GK+: reading acquired; task done");
-      vTaskDelete(nullptr);
-      return;
+  auto writeFrame = [&](const uint8_t* buf, size_t n, bool withResponse, const char* label) {
+    if (!buf || n == 0) return;
+    const bool ok = chWrite->writeValue(buf, n, withResponse);
+    Serial.printf("GK+: TX %s (%u bytes) => %s\n", label ? label : "", (unsigned)n, ok ? "OK" : "FAIL");
+  };
+
+  writeFrame(kReqInfo66, sizeof(kReqInfo66), false, "0x66");
+  vTaskDelay(pdMS_TO_TICKS(120));
+  writeFrame(kReqInitAa, sizeof(kReqInitAa), false, "0xAA");
+  vTaskDelay(pdMS_TO_TICKS(120));
+  writeFrame(kReqInfo77, sizeof(kReqInfo77), false, "0x77");
+  vTaskDelay(pdMS_TO_TICKS(120));
+  writeFrame(kReqInfo66, sizeof(kReqInfo66), false, "0x66 (again)");
+  vTaskDelay(pdMS_TO_TICKS(120));
+  writeFrame(kReqCountDb, sizeof(kReqCountDb), false, "0xDB (records count)");
+
+  const uint32_t t0 = millis();
+  std::vector<uint8_t> cmd16;
+  bool sentXfer = false;
+  while (client->isConnected()) {
+    if (isAnyDemoGateActive()) break;
+    if (sess.gotReading) break;
+
+    const uint32_t elapsed = millis() - t0;
+    if (elapsed > 8000) {
+      Serial.println("GK+: timeout waiting for reading; retry");
+      break;
     }
 
-    vTaskDelay(pdMS_TO_TICKS(800));
+    if (sess.gotDbCount && !sentXfer) {
+      sentXfer = true;
+      buildLatestRecords16Command(2, &cmd16);
+      if (!cmd16.empty()) {
+        writeFrame(cmd16.data(), cmd16.size(), false, "0x16 (latest records n=2)");
+      }
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
+
+  const bool okReading = sess.gotReading;
+  sSession = nullptr;
+  setBleConnected(false);
+  client->disconnect();
+  NimBLEDevice::deleteClient(client);
+  return okReading;
+}
+
+static void gkplusTask(void* /*param*/) {
+  Serial.println("BLE: sensor task start");
+
+  NimBLEDevice::init("");
+  NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+  NimBLEScan* scan = NimBLEDevice::getScan();
+  for (;;) {
+    if (isAnyDemoGateActive()) {
+      pulseox_demo_lvgl_set_live_mode(false);
+      vTaskDelay(pdMS_TO_TICKS(500));
+      continue;
+    }
+
+    requestUiStep(4);
+    BleTargetCandidate target;
+    if (!scanForSupportedTarget(scan, &target)) {
+      vTaskDelay(pdMS_TO_TICKS(300));
+      continue;
+    }
+
+    if (target.kind == kTargetPulseOx && isPulseOxReconnectCooldownActive()) {
+      vTaskDelay(pdMS_TO_TICKS(300));
+      continue;
+    }
+
+    const char* kindStr = (target.kind == kTargetPulseOx) ? "PO3" : "GK+";
+    Serial.printf("BLE: found %s addr=%s name='%s' rssi=%d\n", kindStr, target.address.toString().c_str(),
+                  target.name.c_str(), (int)target.rssi);
+
+    bool ok = false;
+    if (target.kind == kTargetPulseOx) {
+      ok = runPulseOxSession(target);
+    } else if (target.kind == kTargetGkPlus) {
+      ok = runGkPlusSession(target);
+      if (ok) {
+        Serial.println("GK+: reading acquired; task done");
+        vTaskDelete(nullptr);
+        return;
+      }
+    }
+
+    if (!ok) {
+      vTaskDelay(pdMS_TO_TICKS(800));
+    }
   }
 }
 
