@@ -895,8 +895,12 @@ static void requestUiStep(int step) {
 }
 
 static float computeShownGki(float glucoseMgDl, float ketoneMmolL) {
-  if (!(ketoneMmolL > 0.0f)) return NAN;
-  const float gki = (glucoseMgDl / 18.0f) / ketoneMmolL;
+  // Match web/official displayed GKI behavior by computing from the rounded
+  // displayed inputs, not the raw decoded floats.
+  const float shownGluMgDl = roundf(glucoseMgDl);
+  const float shownKetMmolL = floorf((ketoneMmolL * 10.0f) + 0.5f) / 10.0f;
+  if (!(shownKetMmolL > 0.0f)) return NAN;
+  const float gki = (shownGluMgDl / 18.0f) / shownKetMmolL;
   return floorf(gki * 10.0f) / 10.0f;
 }
 
@@ -1361,37 +1365,6 @@ static void drawOverlay() {
     tft.setTextDatum(MC_DATUM);
     tft.setTextSize(1);
     tft.drawString("NO WIFI", kPanelW / 2, bannerH / 2);
-
-    // Broken Wi-Fi icon (simple arcs + slash), drawn bold for legibility.
-    const int cx = kPanelW / 2;
-    const int cy = 72;
-    const int thick = 2;
-    auto drawThickPixel = [&](int x, int y, uint16_t c) {
-      tft.fillRect(x - (thick - 1), y - (thick - 1), thick * 2 - 1, thick * 2 - 1, c);
-    };
-
-    tft.fillCircle(cx, cy, 4, TFT_WHITE);
-    auto drawArcPoints = [&](int r, float a0, float a1) {
-      const int steps = max(12, (int)(r * 3));
-      for (int i = 0; i <= steps; i++) {
-        const float t = (float)i / (float)steps;
-        const float a = a0 + (a1 - a0) * t;
-        const int x = cx + (int)lroundf(cosf(a) * (float)r);
-        const int y = cy + (int)lroundf(sinf(a) * (float)r);
-        drawThickPixel(x, y, TFT_WHITE);
-      }
-    };
-
-    // Arcs above the dot
-    drawArcPoints(14, -2.6f, -0.55f);
-    drawArcPoints(22, -2.6f, -0.55f);
-    drawArcPoints(30, -2.6f, -0.55f);
-
-    // Slash to indicate broken (thicker)
-    tft.drawLine(cx - 22, cy - 30, cx + 22, cy + 8, TFT_RED);
-    tft.drawLine(cx - 21, cy - 30, cx + 23, cy + 8, TFT_RED);
-    tft.drawLine(cx - 23, cy - 30, cx + 21, cy + 8, TFT_RED);
-    tft.drawLine(cx - 22, cy - 29, cx + 22, cy + 9, TFT_RED);
 
     // WiFiManager setup QR (join the portal AP).
     const int quiet = 2;
@@ -2185,6 +2158,55 @@ static void renderTask(void* /*param*/) {
 static void renderAndPushLottieFrame() {
   if (!gAnim || !gFrameArgb || !gFrame565) return;
 
+  const bool labelFxActive = isLabelFxActive();
+  const bool suppressAnimForReveal = (!gShowLoading && (gOverlayRevealActive || labelFxActive));
+  static bool sAnimPausedForReveal = false;
+  static bool sAnimAreaClearedForReveal = false;
+  static uint32_t sAnimPauseStartMs = 0;
+
+  // Pause the animation timeline entirely while the reveal or label wipe is
+  // active so the flames neither advance off-screen nor require repeated clears.
+  if (suppressAnimForReveal) {
+    if (!sAnimPausedForReveal) {
+      sAnimPausedForReveal = true;
+      sAnimPauseStartMs = millis();
+    }
+  } else if (sAnimPausedForReveal) {
+    const uint32_t pausedMs = millis() - sAnimPauseStartMs;
+    gAnimStartMs += pausedMs;
+    sAnimPausedForReveal = false;
+    sAnimAreaClearedForReveal = false;
+  }
+
+  // Push to display.
+  int x = 0;
+  int y = 0;
+  getPanelAbsXY(&x, &y);
+
+  // Only push the animation below the overlay header so UI text persists.
+  // For LOADING, reserve a small status strip at the top so the label remains
+  // stable without needing per-frame redraws.
+  const int animY0 = gShowLoading ? kLoadingStatusH : max(0, min(kOverlayH, kPanelH));
+  // Also reserve a bottom status strip for time + dots.
+  const int animH = max(0, (kPanelH - kBottomStatusH) - animY0);
+
+  if (suppressAnimForReveal) {
+    if (!sAnimAreaClearedForReveal && animH > 0) {
+      tft.fillRect(x, y + animY0, kPanelW, animH, TFT_BLACK);
+      sAnimAreaClearedForReveal = true;
+    }
+
+    if (gOverlayDirty || gOverlayRevealActive || labelFxActive) {
+      gOverlayDirty = false;
+      drawOverlay();
+    }
+
+    if (!labelFxActive) {
+      drawStatusDots();
+    }
+    return;
+  }
+
   const uint32_t now = millis();
   const uint32_t elapsedMs = now - gAnimStartMs;
   const double frameF = (elapsedMs * gAnimFps) / 1000.0;
@@ -2273,19 +2295,6 @@ static void renderAndPushLottieFrame() {
     }
   }
 
-  const bool labelFxActive = isLabelFxActive();
-
-  // Push to display.
-  int x = 0;
-  int y = 0;
-  getPanelAbsXY(&x, &y);
-
-  // Only push the animation below the overlay header so UI text persists.
-  // For LOADING, reserve a small status strip at the top so the label remains
-  // stable without needing per-frame redraws.
-  const int animY0 = gShowLoading ? kLoadingStatusH : max(0, min(kOverlayH, kPanelH));
-  // Also reserve a bottom status strip for time + dots.
-  const int animH = max(0, (kPanelH - kBottomStatusH) - animY0);
   if (!labelFxActive && animH > 0) {
     tft.setSwapBytes(kSwapBytesForPushImage);
     tft.startWrite();
@@ -2419,9 +2428,10 @@ void setup() {
 
   printDisplayConfig();
 
-  // Backlight: leave it ON (no boot flashing).
-  setBacklight(true);
-  delay(50);
+  // Keep the panel dark until the controller is initialized and we've drawn
+  // a known-black first frame.
+  setBacklight(false);
+  delay(20);
 
   // Ensure the SPI peripheral is initialized before TFT_eSPI starts using
   // transactions. This avoids a null SPI bus handle on some ESP32-S3 setups.
@@ -2440,9 +2450,6 @@ void setup() {
   tft.fillScreen(TFT_BLACK);
   delay(80);
 
-  // Keep backlight steady (no boot flashing).
-  setBacklight(true);
-
   if (kDisplayBringupMode) {
     Serial.println("Display init done (bring-up mode): slow xOff sweep");
   } else {
@@ -2458,6 +2465,11 @@ void setup() {
       drawBootScreen();
     }
   }
+
+  // Only light the panel after we've initialized the controller and painted a
+  // deterministic first frame; this avoids showing controller junk at boot.
+  setBacklight(true);
+  delay(20);
 
   initLottie();
 
