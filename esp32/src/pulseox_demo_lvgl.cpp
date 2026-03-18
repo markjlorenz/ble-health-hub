@@ -75,6 +75,7 @@ struct GaugeUi {
   lv_color_t* canvas_buf = nullptr;
   lv_obj_t* label = nullptr;
   lv_obj_t* value = nullptr;
+  lv_obj_t* status = nullptr;
 };
 
 static GaugeUi s_gauges[kGaugeCount];
@@ -83,6 +84,7 @@ static uint32_t s_gauge_alert_start_ms[kGaugeCount] = {0, 0, 0};
 static int s_gauge_canvas_size = 0;
 
 static lv_obj_t* s_signal_panel = nullptr;
+static lv_obj_t* s_signal_label = nullptr;
 static lv_obj_t* s_signal_frame = nullptr;
 static lv_obj_t* s_signal_bars[8] = {nullptr};
 static lv_obj_t* s_signal_peak_marker = nullptr;
@@ -263,6 +265,14 @@ static void draw_radial_tick(lv_color_t* buf, int size, float angle_deg, int inn
   paint_dot(buf, size, tip_x, tip_y, 1, color);
 }
 
+static void update_gauge_status_ui(int gauge_idx, float value) {
+  if (gauge_idx < 0 || gauge_idx >= kGaugeCount) return;
+  GaugeUi& gauge = s_gauges[gauge_idx];
+  if (!gauge.status) return;
+  (void)value;
+  lv_obj_add_flag(gauge.status, LV_OBJ_FLAG_HIDDEN);
+}
+
 static float gauge_alert_mix(int gauge_idx, uint32_t now_ms) {
   if (gauge_idx < 0 || gauge_idx >= kGaugeCount) return 0.0f;
   if (!s_gauge_out_of_range[gauge_idx]) return 0.0f;
@@ -317,6 +327,7 @@ static void draw_gauge_canvas(int gauge_idx, float value, uint32_t now_ms) {
   const lv_color_t bg = kPanelBg();
   const lv_color_t track = kGaugeTrack();
   const lv_color_t normal = make_rgb_u32(spec.accent_rgb);
+  const lv_color_t trail = lv_color_mix(normal, track, (lv_opa_t)89);
   const lv_opa_t mix = (lv_opa_t)lroundf(gauge_alert_mix(gauge_idx, now_ms) * 255.0f);
   const lv_color_t inner = lv_color_mix(kGaugeAlertRed(), kGaugeInner(), mix);
 
@@ -342,9 +353,14 @@ static void draw_gauge_canvas(int gauge_idx, float value, uint32_t now_ms) {
     }
   }
 
+  brighten_range_band(gauge.canvas_buf, size, 0.0f, marker_delta, inner_r + 1.0f, outer_r - 1.0f, trail);
   brighten_range_band(gauge.canvas_buf, size, normal_start, normal_end, inner_r, outer_r, normal);
   draw_radial_tick(gauge.canvas_buf, size, marker_angle, (int)inner_r - 1, (int)outer_r,
                    marker_over_normal ? kNeedleBlack() : kNeedleWhite());
+  const float marker_rad = marker_angle * 3.14159265f / 180.0f;
+  const int tip_x = (int)lroundf((float)cx + cosf(marker_rad) * (outer_r - 1.5f));
+  const int tip_y = (int)lroundf((float)cy + sinf(marker_rad) * (outer_r - 1.5f));
+  paint_dot(gauge.canvas_buf, size, tip_x, tip_y, 2, marker_over_normal ? kNeedleBlack() : normal);
   lv_obj_invalidate(gauge.canvas);
 }
 
@@ -363,16 +379,18 @@ static void update_gauge_labels(float spo2, float hr, float pi, uint32_t now_ms)
     }
     lv_label_set_text(s_gauges[i].value, buf);
     lv_obj_align_to(s_gauges[i].value, s_gauges[i].canvas, LV_ALIGN_CENTER, 0, 0);
+    update_gauge_status_ui(i, values[i]);
     draw_gauge_canvas(i, values[i], now_ms);
   }
 }
 
-static void set_segment_level(int level_0_to_8) {
+static void set_segment_level(int level_0_to_8, float pulse_mix = 1.0f) {
   const int lvl = max(0, min(8, level_0_to_8));
   for (int i = 0; i < 8; i++) {
     if (!s_signal_bars[i]) continue;
     const bool on = i < lvl;
-    lv_obj_set_style_bg_color(s_signal_bars[i], on ? kSignalOn() : kSignalOff(), 0);
+    lv_color_t on_color = lv_color_mix(kTextBright(), kSignalOn(), (lv_opa_t)lroundf(clamp01(pulse_mix) * 255.0f));
+    lv_obj_set_style_bg_color(s_signal_bars[i], on ? on_color : kSignalOff(), 0);
     lv_obj_set_style_bg_opa(s_signal_bars[i], on ? LV_OPA_COVER : LV_OPA_70, 0);
     lv_obj_set_style_border_color(s_signal_bars[i], on ? kTextBright() : kPanelBorder(), 0);
   }
@@ -423,9 +441,9 @@ static void update_demo_readings(uint32_t t_ms) {
   const uint32_t stage_t = (uint32_t)(t_ms % kStageMs);
   const int next_stage = (stage + 1) % 3;
 
-  const float hr_base[3] = {72.0f, 88.0f, 110.0f};
-  const float spo2_base[3] = {98.0f, 92.0f, 86.0f};
-  const float pi_base[3] = {2.6f, 1.7f, 0.9f};
+  const float hr_base[3] = {72.0f, 128.0f, 110.0f};
+  const float spo2_base[3] = {98.0f, 95.0f, 86.0f};
+  const float pi_base[3] = {2.6f, 21.2f, 0.9f};
 
   float mix = 0.0f;
   if (stage_t > (kStageMs - kRampMs)) {
@@ -453,7 +471,7 @@ static void update_demo_readings(uint32_t t_ms) {
   s_demo_hr = hr;
   s_demo_pi = pi;
 
-  set_segment_level(seg);
+  set_segment_level(seg, 0.35f + 0.65f * sig);
   update_peak_gauge(sig, t_ms);
   update_gauge_labels(spo2, hr, pi, t_ms);
 }
@@ -462,7 +480,7 @@ static void update_live_readings(uint32_t now_ms, uint32_t dt_ms) {
   const int seg = max(0, min(8, s_live_signal_level));
   const float sig = (float)seg / 8.0f;
   ease_live_display_values(dt_ms);
-  set_segment_level(seg);
+  set_segment_level(seg, 0.55f + 0.45f * sig);
   update_peak_gauge(sig, now_ms);
   update_gauge_labels(s_display_spo2, s_display_hr, s_display_pi, now_ms);
 }
@@ -482,7 +500,8 @@ static void style_panel(lv_obj_t* obj, lv_color_t border) {
 static void style_signal_panel(lv_obj_t* obj) {
   lv_obj_clear_flag(obj, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_set_style_radius(obj, 6, 0);
-  lv_obj_set_style_border_width(obj, 0, 0);
+  lv_obj_set_style_border_width(obj, 1, 0);
+  lv_obj_set_style_border_color(obj, kPanelBorder(), 0);
   lv_obj_set_style_bg_color(obj, kPanelBg(), 0);
   lv_obj_set_style_bg_opa(obj, LV_OPA_COVER, 0);
   lv_obj_set_style_shadow_width(obj, 0, 0);
@@ -496,7 +515,7 @@ static void create_ui() {
   lv_obj_set_style_bg_color(scr, kScreenBg(), 0);
   lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
 
-  static constexpr int kSignalPanelH = 24;
+  static constexpr int kSignalPanelH = 30;
   static constexpr int kSignalOuterGap = 4;
   const int card_w = min(s_panel_w - 4, 72);
   const int card_h = 72;
@@ -545,6 +564,18 @@ static void create_ui() {
     lv_obj_set_style_text_color(gauge.value, kTextBright(), 0);
     lv_obj_set_size(gauge.value, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
     lv_obj_align(gauge.value, LV_ALIGN_CENTER, 0, 0);
+
+    gauge.status = lv_label_create(gauge.card);
+    lv_label_set_text(gauge.status, "OK");
+    lv_obj_set_style_text_font(gauge.status, &lv_font_unscii_8, 0);
+    lv_obj_set_style_text_color(gauge.status, kNeedleBlack(), 0);
+    lv_obj_set_style_bg_color(gauge.status, make_rgb_u32(kGaugeSpecs[i].accent_rgb), 0);
+    lv_obj_set_style_bg_opa(gauge.status, LV_OPA_COVER, 0);
+    lv_obj_set_style_pad_hor(gauge.status, 3, 0);
+    lv_obj_set_style_pad_ver(gauge.status, 1, 0);
+    lv_obj_set_style_radius(gauge.status, 3, 0);
+    lv_obj_set_pos(gauge.status, card_w - 23, 5);
+    lv_obj_add_flag(gauge.status, LV_OBJ_FLAG_HIDDEN);
   }
 
   s_signal_panel = lv_obj_create(scr);
@@ -552,10 +583,16 @@ static void create_ui() {
   lv_obj_set_size(s_signal_panel, card_w, kSignalPanelH);
   style_signal_panel(s_signal_panel);
 
+  s_signal_label = lv_label_create(s_signal_panel);
+  lv_label_set_text(s_signal_label, "PULSE");
+  lv_obj_set_style_text_font(s_signal_label, &lv_font_unscii_8, 0);
+  lv_obj_set_style_text_color(s_signal_label, kTextDim(), 0);
+  lv_obj_align(s_signal_label, LV_ALIGN_BOTTOM_MID, 0, -1);
+
   const int signal_frame_x = 0;
-  const int signal_frame_y = 0;
+  const int signal_frame_y = 2;
   const int signal_frame_w = card_w - (signal_frame_x * 2);
-  const int signal_frame_h = kSignalPanelH - (signal_frame_y * 2);
+  const int signal_frame_h = 14;
   s_signal_frame = lv_obj_create(s_signal_panel);
   lv_obj_set_pos(s_signal_frame, signal_frame_x, signal_frame_y);
   lv_obj_set_size(s_signal_frame, signal_frame_w, signal_frame_h);

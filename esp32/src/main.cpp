@@ -158,6 +158,7 @@ static void drawPulseOxMetrics();
 static bool isGkDemoGateActive();
 static bool isPulseOxDemoGateActive();
 static bool isAnyDemoGateActive();
+static bool isDemoNoWifiScreen();
 static void setBleConnected(bool v);
 
 static inline uint16_t rgba8888ToRgb565(uint32_t argb) {
@@ -218,6 +219,10 @@ static bool isPulseOxDemoGateActive() {
 
 static bool isAnyDemoGateActive() {
   return isGkDemoGateActive() || isPulseOxDemoGateActive();
+}
+
+static bool isDemoNoWifiScreen() {
+  return kDemoMode && isAnyDemoGateActive();
 }
 
 static volatile bool gBleConnected = false;
@@ -864,28 +869,57 @@ static void wifiTask(void* /*param*/) {
   }
 
   // Next: normal connect using stored credentials (scan).
-  Serial.println("WIFI: begin() using stored credentials");
-  WiFi.begin();
-  if (waitForWifiConnected(8000)) {
-    Serial.printf("WIFI: connected ip=%s\n", WiFi.localIP().toString().c_str());
-    rtcWifiCacheUpdateFromCurrent();
-    vTaskDelete(nullptr);
-    return;
+  String storedSsid;
+  String storedPass;
+  if (readStoredStaConfig(&storedSsid, &storedPass)) {
+    Serial.printf("WIFI: begin() using stored credentials ssid='%s'\n", storedSsid.c_str());
+    WiFi.begin();
+    if (waitForWifiConnected(8000)) {
+      Serial.printf("WIFI: connected ip=%s\n", WiFi.localIP().toString().c_str());
+      rtcWifiCacheUpdateFromCurrent();
+      vTaskDelete(nullptr);
+      return;
+    }
+    Serial.println("WIFI: stored-credential connect failed");
+  } else {
+    Serial.println("WIFI: no stored credentials; skipping WiFi.begin()");
   }
 
   // Fallback: WiFiManager portal.
   Serial.println("WIFI: launching WiFiManager portal");
+  WiFi.disconnect(false, false);
+  delay(100);
+  WiFi.mode(WIFI_AP_STA);
   WiFiManager wm;
   wm.setAPCallback(onWmApStarted);
+  wm.setCaptivePortalEnable(true);
+  wm.setWiFiAutoReconnect(true);
+  wm.setCleanConnect(true);
+  wm.setConnectTimeout(30);
+  wm.setSaveConnectTimeout(30);
+  wm.setConfigPortalBlocking(false);
   // Keep portal name stable so your phone remembers it.
-  const bool ok = wm.autoConnect("ble-health-hub");
-  if (ok) {
-    Serial.printf("WIFI: WiFiManager connected ip=%s\n", WiFi.localIP().toString().c_str());
-    rtcWifiCacheUpdateFromCurrent();
-    gForceNoWifiScreen = false;
-    gOverlayDirty = true;
-  } else {
-    Serial.println("WIFI: WiFiManager failed or timed out");
+  const bool started = wm.startConfigPortal("ble-health-hub");
+  if (!started && !wm.getConfigPortalActive()) {
+    Serial.println("WIFI: failed to start WiFiManager portal");
+    vTaskDelete(nullptr);
+    return;
+  }
+
+  while (wm.getConfigPortalActive()) {
+    const bool connected = wm.process();
+    if (connected || WiFi.status() == WL_CONNECTED) {
+      Serial.printf("WIFI: WiFiManager connected ip=%s\n", WiFi.localIP().toString().c_str());
+      rtcWifiCacheUpdateFromCurrent();
+      gForceNoWifiScreen = false;
+      gOverlayDirty = true;
+      break;
+    }
+    vTaskDelay(pdMS_TO_TICKS(20));
+  }
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WIFI: WiFiManager portal exited without connection");
   }
 
   vTaskDelete(nullptr);
@@ -2290,6 +2324,8 @@ static void setLoopToLogLoading() {
 
 static void drawOverlay() {
   if (gShowNoWifi) {
+    const bool demoNoWifi = isDemoNoWifiScreen();
+
     // Full-screen static screen.
     setupKetosisLabelColorsOnce();
     applyPanelViewport();
@@ -2305,18 +2341,34 @@ static void drawOverlay() {
     tft.setTextSize(1);
     tft.drawString("NO WIFI", kPanelW / 2, bannerH / 2);
 
-    // WiFiManager setup QR (join the portal AP).
-    const int quiet = 2;
-    const int scale = 2;
-    const int qrPx = (29 + 2 * quiet) * scale;
-    const int qrX = (kPanelW - qrPx) / 2;
-    const int qrY = 120;
-    drawQrCodeFromText(gPortalQrPayload, qrX, qrY, scale, quiet);
+    if (demoNoWifi) {
+      const int quiet = 2;
+      const int scale = 2;
+      const int qrPx = (29 + 2 * quiet) * scale;
+      const int qrX = (kPanelW - qrPx) / 2;
+      const int qrY = 104;
+      drawQrCodeFromText("WIFI:T:nopass;S:ble-health-hub;;", qrX, qrY, scale, quiet);
 
-    tft.setTextDatum(TC_DATUM);
-    tft.setTextSize(1);
-    tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-    tft.drawString("Scan to setup", kPanelW / 2, qrY + qrPx + 8);
+      tft.setTextDatum(TC_DATUM);
+      tft.setTextSize(1);
+      tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+      tft.drawString("Demo QR", kPanelW / 2, qrY + qrPx + 8);
+      tft.drawString("Sample setup view", kPanelW / 2, qrY + qrPx + 20);
+    } else {
+      // WiFiManager setup QR (join the portal AP).
+      const int quiet = 2;
+      const int scale = 2;
+      const int qrPx = (29 + 2 * quiet) * scale;
+      const int qrX = (kPanelW - qrPx) / 2;
+      const int qrY = 120;
+      drawQrCodeFromText(gPortalQrPayload, qrX, qrY, scale, quiet);
+
+      tft.setTextDatum(TC_DATUM);
+      tft.setTextSize(1);
+      tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+      tft.drawString("Scan to setup", kPanelW / 2, qrY + qrPx + 8);
+    }
+
     tft.setTextDatum(TL_DATUM);
     drawStatusDots();
     return;
@@ -3012,7 +3064,7 @@ static void renderTask(void* /*param*/) {
     // PulseOx demo should run even if RLottie isn't ready.
     // If both demo gates are grounded, PulseOx takes precedence.
     if (kDemoMode && pulseGate) {
-      const int nextStep = (gForceNoWifiScreen ? 5 : 7);
+      const int nextStep = 7;
       if (nextStep != appliedStep) {
         appliedStep = nextStep;
         Serial.printf("DEMO: step=%d\n", appliedStep);
@@ -3029,7 +3081,7 @@ static void renderTask(void* /*param*/) {
         // GK+ demo cycle: Loading -> Not -> Low -> Mid -> High -> WiFi
         static constexpr int kDemoOrder[kDemoSteps] = {4, 0, 1, 2, 3, 5};
         const int idx = (int)(((now - gDemoStartMs) / kDemoStepMs) % kDemoSteps);
-        const int nextStep = (gForceNoWifiScreen ? 5 : kDemoOrder[idx]);
+        const int nextStep = kDemoOrder[idx];
         if (nextStep != appliedStep) {
           appliedStep = nextStep;
           Serial.printf("DEMO: step=%d\n", appliedStep);
