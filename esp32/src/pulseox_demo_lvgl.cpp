@@ -7,6 +7,7 @@
 #endif
 
 #include <cmath>
+#include <cstring>
 #include <cstdio>
 
 namespace {
@@ -27,6 +28,17 @@ static lv_disp_draw_buf_t s_draw_buf;
 static lv_disp_drv_t s_disp_drv;
 static lv_color_t* s_buf1 = nullptr;
 static lv_color_t* s_buf2 = nullptr;
+static constexpr bool kSerialFrameTraceEnabled = true;
+static constexpr int kSerialFrameTraceGateGpio = 7;
+static constexpr uint32_t kSerialFrameTraceIntervalMs = 300;
+static constexpr int kSerialTraceW = 38;
+static constexpr int kSerialTraceH = 68;
+static uint8_t s_serial_trace_buf[kSerialTraceW * kSerialTraceH] = {0};
+static bool s_serial_trace_dirty = false;
+static bool s_serial_trace_banner_sent = false;
+static uint32_t s_serial_trace_last_emit_ms = 0;
+static uint32_t s_serial_trace_seq = 0;
+static bool s_serial_trace_last_gate_state = false;
 
 static uint32_t s_last_pump_ms = 0;
 static float s_peak_sig = 0.0f;
@@ -47,10 +59,14 @@ static int s_live_signal_level = 0;
 
 static constexpr int kBottomStatusH = 12;
 static constexpr int kGaugeCount = 3;
-static constexpr float kGaugeStartDeg = 140.0f;
-static constexpr float kGaugeSweepDeg = 260.0f;
+static constexpr float kGaugeStartDeg = 135.0f;
+static constexpr float kGaugeSweepDeg = 240.0f;
 static constexpr uint32_t kGaugeAlertPulseMs = 240;
 static constexpr int kGaugeAlertPulseCount = 3;
+static constexpr int kGaugeTextBottomInset = 3;
+static constexpr int kGaugeTextRightInset = 5;
+static constexpr int kGaugeTextLeftInset = 3;
+static constexpr int kGaugeValueSlotW = 38;
 
 struct GaugeSpec {
   const char* label;
@@ -80,6 +96,7 @@ struct GaugeUi {
 
 static GaugeUi s_gauges[kGaugeCount];
 static bool s_gauge_out_of_range[kGaugeCount] = {false, false, false};
+static bool s_gauge_alert_fired[kGaugeCount] = {false, false, false};
 static uint32_t s_gauge_alert_start_ms[kGaugeCount] = {0, 0, 0};
 static int s_gauge_canvas_size = 0;
 
@@ -94,6 +111,10 @@ static int s_signal_bar_w = 0;
 static int s_signal_bar_h = 0;
 static int s_signal_bar_gap = 0;
 static int s_signal_inner_w = 0;
+
+static void serial_trace_capture_area(const lv_area_t* area, const lv_color_t* color_p);
+static void serial_trace_emit_if_due(uint32_t now_ms);
+static bool serial_trace_gate_active();
 
 static lv_color_t make_rgb(uint8_t r, uint8_t g, uint8_t b) {
   if (s_swap_red_blue) {
@@ -186,6 +207,7 @@ static void flush_cb(lv_disp_drv_t* disp, const lv_area_t* area, lv_color_t* col
   s_tft->pushImage(ax + area->x1, ay + area->y1, w, h, (uint16_t*)color_p);
   s_tft->endWrite();
   s_tft->setSwapBytes(false);
+  serial_trace_capture_area(area, color_p);
 
   lv_disp_flush_ready(disp);
 }
@@ -220,6 +242,111 @@ static float ease_toward(float current, float target, uint32_t dt_ms) {
   if (dt_ms == 0) return current;
   const float alpha = 1.0f - expf(-(float)dt_ms / kTauMs);
   return current + (target - current) * alpha;
+}
+
+static bool serial_trace_gate_active() {
+  if (!kSerialFrameTraceEnabled) return false;
+  return digitalRead(kSerialFrameTraceGateGpio) == LOW;
+}
+
+static uint8_t trace_palette_index(lv_color_t color) {
+  uint8_t r = (uint8_t)((uint32_t)color.ch.red * 255u / 31u);
+  const uint8_t g = (uint8_t)((uint32_t)color.ch.green * 255u / 63u);
+  uint8_t b = (uint8_t)((uint32_t)color.ch.blue * 255u / 31u);
+  if (s_swap_red_blue) { const uint8_t t = r; r = b; b = t; }
+  const uint8_t maxc = max(r, max(g, b));
+
+  if (maxc < 14u) return 0;
+  if (r > 180u && g < 95u && b < 95u) return 7;
+  if (r > 180u && g > 140u && b < 110u) return 6;
+  if (b > 140u && g > 120u) return 4;
+  if (g > 150u && r < 190u && b < 170u) return 5;
+  if (r > 215u && g > 215u && b > 215u) return 3;
+  if (r > 150u && g > 150u && b < 130u) return 8;
+  if (maxc > 95u) return 2;
+  return 1;
+}
+
+static void serial_trace_capture_area(const lv_area_t* area, const lv_color_t* color_p) {
+  if (!serial_trace_gate_active() || !area || !color_p || s_panel_w <= 0 || s_ui_h <= 0) return;
+
+  const int w = area->x2 - area->x1 + 1;
+  const int h = area->y2 - area->y1 + 1;
+  for (int sy = 0; sy < h; sy++) {
+    const int y = area->y1 + sy;
+    if (y < 0 || y >= s_ui_h) continue;
+    const int ty = (y * kSerialTraceH) / s_ui_h;
+    const int trace_row = ty * kSerialTraceW;
+    const int src_row = sy * w;
+    for (int sx = 0; sx < w; sx++) {
+      const int x = area->x1 + sx;
+      if (x < 0 || x >= s_panel_w) continue;
+      const int tx = (x * kSerialTraceW) / s_panel_w;
+      s_serial_trace_buf[trace_row + tx] = trace_palette_index(color_p[src_row + sx]);
+    }
+  }
+  s_serial_trace_dirty = true;
+}
+
+static void serial_trace_emit_if_due(uint32_t now_ms) {
+  const bool gate_active = serial_trace_gate_active();
+  if (gate_active != s_serial_trace_last_gate_state) {
+    s_serial_trace_last_gate_state = gate_active;
+    s_serial_trace_banner_sent = false;
+    s_serial_trace_dirty = false;
+    s_serial_trace_last_emit_ms = now_ms;
+    Serial.printf("FBTRACE gpio=%d state=%s\n", kSerialFrameTraceGateGpio, gate_active ? "ON" : "OFF");
+  }
+
+  if (!gate_active || !s_serial_trace_dirty) return;
+  if ((now_ms - s_serial_trace_last_emit_ms) < kSerialFrameTraceIntervalMs) return;
+  if (!Serial || Serial.availableForWrite() < 96) return;
+
+  if (!s_serial_trace_banner_sent) {
+    Serial.printf("FBMETA v3 gpio=%d active=LOW w=%d h=%d fmt=b64_4bpp\n",
+                  kSerialFrameTraceGateGpio, kSerialTraceW, kSerialTraceH);
+    s_serial_trace_banner_sent = true;
+  }
+
+  // Pack 4-bit-per-pixel (high nibble first), then base64 encode.
+  static constexpr int kTotalPx = kSerialTraceW * kSerialTraceH;           // 2584
+  static constexpr int kPackedBytes = (kTotalPx + 1) / 2;                  // 1292
+  static constexpr char b64[] =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+  uint8_t packed[kPackedBytes];
+  for (int i = 0; i < kTotalPx; i += 2) {
+    const uint8_t hi = s_serial_trace_buf[i] & 0x0F;
+    const uint8_t lo = (i + 1 < kTotalPx) ? (s_serial_trace_buf[i + 1] & 0x0F) : 0;
+    packed[i >> 1] = (uint8_t)((hi << 4) | lo);
+  }
+
+  Serial.print("FB ");
+  Serial.print(s_serial_trace_seq++);
+  Serial.print(' ');
+
+  char line[96];
+  int used = 0;
+  for (int i = 0; i < kPackedBytes; i += 3) {
+    const uint8_t a = packed[i];
+    const uint8_t b = (i + 1 < kPackedBytes) ? packed[i + 1] : 0;
+    const uint8_t c = (i + 2 < kPackedBytes) ? packed[i + 2] : 0;
+    line[used++] = b64[(a >> 2) & 0x3F];
+    line[used++] = b64[((a << 4) | (b >> 4)) & 0x3F];
+    line[used++] = b64[((b << 2) | (c >> 6)) & 0x3F];
+    line[used++] = b64[c & 0x3F];
+    if (used >= (int)sizeof(line) - 4) {
+      Serial.write((const uint8_t*)line, used);
+      used = 0;
+    }
+  }
+  if (used > 0) {
+    Serial.write((const uint8_t*)line, used);
+  }
+  Serial.println();
+
+  s_serial_trace_dirty = false;
+  s_serial_trace_last_emit_ms = now_ms;
 }
 
 static void ease_live_display_values(uint32_t dt_ms) {
@@ -259,18 +386,23 @@ static void draw_radial_tick(lv_color_t* buf, int size, float angle_deg, int inn
     const int y = (int)lroundf((float)cy + uy * (float)radius);
     paint_dot(buf, size, x, y, 1, color);
   }
-
-  const int tip_x = (int)lroundf((float)cx + ux * (float)outer_r);
-  const int tip_y = (int)lroundf((float)cy + uy * (float)outer_r);
-  paint_dot(buf, size, tip_x, tip_y, 1, color);
 }
 
 static void update_gauge_status_ui(int gauge_idx, float value) {
   if (gauge_idx < 0 || gauge_idx >= kGaugeCount) return;
   GaugeUi& gauge = s_gauges[gauge_idx];
   if (!gauge.status) return;
-  (void)value;
-  lv_obj_add_flag(gauge.status, LV_OBJ_FLAG_HIDDEN);
+
+  const GaugeSpec& spec = kGaugeSpecs[gauge_idx];
+  const bool low = value < spec.normal_min;
+  const bool high = value > spec.normal_max;
+  const char* text = low ? "LOW" : (high ? "HI" : "OK");
+  lv_color_t color = low ? kTextBright() : (high ? make_rgb_u32(spec.accent_rgb) : kTextDim());
+
+  lv_label_set_text(gauge.status, text);
+  lv_obj_set_style_text_color(gauge.status, color, 0);
+  lv_obj_clear_flag(gauge.status, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_align_to(gauge.status, gauge.canvas, LV_ALIGN_CENTER, 0, 0);
 }
 
 static float gauge_alert_mix(int gauge_idx, uint32_t now_ms) {
@@ -295,11 +427,17 @@ static void update_gauge_alert_state(int gauge_idx, float value, uint32_t now_ms
   if (gauge_idx < 0 || gauge_idx >= kGaugeCount) return;
   const GaugeSpec& spec = kGaugeSpecs[gauge_idx];
   const bool out_of_range = value < spec.normal_min || value > spec.normal_max;
-  if (out_of_range && !s_gauge_out_of_range[gauge_idx]) {
+  if (out_of_range && !s_gauge_alert_fired[gauge_idx]) {
     s_gauge_alert_start_ms[gauge_idx] = now_ms;
+    s_gauge_alert_fired[gauge_idx] = true;
   }
-  if (!out_of_range) {
-    s_gauge_alert_start_ms[gauge_idx] = 0;
+  if (!out_of_range && s_gauge_alert_fired[gauge_idx]) {
+    const uint32_t total_pulse_ms = kGaugeAlertPulseMs * 2u * (uint32_t)kGaugeAlertPulseCount;
+    const uint32_t elapsed = now_ms - s_gauge_alert_start_ms[gauge_idx];
+    if (elapsed >= total_pulse_ms) {
+      s_gauge_alert_start_ms[gauge_idx] = 0;
+      s_gauge_alert_fired[gauge_idx] = false;
+    }
   }
   s_gauge_out_of_range[gauge_idx] = out_of_range;
 }
@@ -315,20 +453,22 @@ static void draw_gauge_canvas(int gauge_idx, float value, uint32_t now_ms) {
   const int cy = size / 2;
   const float outer_r = (float)size * 0.47f;
   const float ring_w = max(5.0f, (float)size * 0.10f);
+  const float sweep_deg = kGaugeSweepDeg;
   const float inner_r = outer_r - ring_w;
   const float core_r = inner_r - 4.0f;
-  const float normal_start = normalize_value(spec.normal_min, spec) * kGaugeSweepDeg;
-  const float normal_end = normalize_value(spec.normal_max, spec) * kGaugeSweepDeg;
+  const float normal_start = normalize_value(spec.normal_min, spec) * sweep_deg;
+  const float normal_end = normalize_value(spec.normal_max, spec) * sweep_deg;
   const float marker_norm = normalize_value(value, spec);
-  const float marker_angle = kGaugeStartDeg + marker_norm * kGaugeSweepDeg;
-  const float marker_delta = marker_norm * kGaugeSweepDeg;
+  const float marker_angle = kGaugeStartDeg + marker_norm * sweep_deg;
+  const float marker_delta = marker_norm * sweep_deg;
   const bool marker_over_normal = marker_delta >= normal_start && marker_delta <= normal_end;
 
   const lv_color_t bg = kPanelBg();
   const lv_color_t track = kGaugeTrack();
   const lv_color_t normal = make_rgb_u32(spec.accent_rgb);
   const lv_color_t trail = lv_color_mix(normal, track, (lv_opa_t)89);
-  const lv_opa_t mix = (lv_opa_t)lroundf(gauge_alert_mix(gauge_idx, now_ms) * 255.0f);
+  const float alert_f = gauge_alert_mix(gauge_idx, now_ms);
+  const lv_opa_t mix = (lv_opa_t)lroundf(alert_f * 255.0f);
   const lv_color_t inner = lv_color_mix(kGaugeAlertRed(), kGaugeInner(), mix);
 
   for (int y = 0; y < size; y++) {
@@ -344,7 +484,7 @@ static void draw_gauge_canvas(int gauge_idx, float value, uint32_t now_ms) {
         float angle_deg = atan2f(dy, dx) * 180.0f / 3.14159265f;
         if (angle_deg < 0.0f) angle_deg += 360.0f;
         const float delta = angle_delta_from_start(angle_deg);
-        if (delta <= kGaugeSweepDeg) {
+        if (delta <= sweep_deg) {
           color = track;
         }
       }
@@ -353,14 +493,21 @@ static void draw_gauge_canvas(int gauge_idx, float value, uint32_t now_ms) {
     }
   }
 
-  brighten_range_band(gauge.canvas_buf, size, 0.0f, marker_delta, inner_r + 1.0f, outer_r - 1.0f, trail);
-  brighten_range_band(gauge.canvas_buf, size, normal_start, normal_end, inner_r, outer_r, normal);
+  static constexpr float kTrailClearanceDeg = 20.0f;
+  const float trail_start = kTrailClearanceDeg;
+  const float trail_limit = max(trail_start, sweep_deg - kTrailClearanceDeg);
+  const float clamped_marker_start = max(marker_delta, trail_start);
+  const float clamped_marker_end = min(marker_delta, trail_limit);
+  if (clamped_marker_end > trail_start) {
+    brighten_range_band(gauge.canvas_buf, size, trail_start, clamped_marker_end, inner_r + 1.0f, outer_r - 1.0f, trail);
+  }
+  const float clamped_normal_start = max(normal_start, trail_start);
+  const float clamped_normal_end = min(normal_end, trail_limit);
+  if (clamped_normal_end > clamped_normal_start) {
+    brighten_range_band(gauge.canvas_buf, size, clamped_normal_start, clamped_normal_end, inner_r, outer_r, normal);
+  }
   draw_radial_tick(gauge.canvas_buf, size, marker_angle, (int)inner_r - 1, (int)outer_r,
                    marker_over_normal ? kNeedleBlack() : kNeedleWhite());
-  const float marker_rad = marker_angle * 3.14159265f / 180.0f;
-  const int tip_x = (int)lroundf((float)cx + cosf(marker_rad) * (outer_r - 1.5f));
-  const int tip_y = (int)lroundf((float)cy + sinf(marker_rad) * (outer_r - 1.5f));
-  paint_dot(gauge.canvas_buf, size, tip_x, tip_y, 2, marker_over_normal ? kNeedleBlack() : normal);
   lv_obj_invalidate(gauge.canvas);
 }
 
@@ -378,7 +525,8 @@ static void update_gauge_labels(float spo2, float hr, float pi, uint32_t now_ms)
       snprintf(buf, sizeof(buf), "%.1f", values[i]);
     }
     lv_label_set_text(s_gauges[i].value, buf);
-    lv_obj_align_to(s_gauges[i].value, s_gauges[i].canvas, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_align(s_gauges[i].value, LV_ALIGN_BOTTOM_RIGHT, -kGaugeTextRightInset, -kGaugeTextBottomInset);
+    lv_obj_align(s_gauges[i].label, LV_ALIGN_BOTTOM_LEFT, kGaugeTextLeftInset, -kGaugeTextBottomInset - 4);
     update_gauge_status_ui(i, values[i]);
     draw_gauge_canvas(i, values[i], now_ms);
   }
@@ -397,7 +545,7 @@ static void set_segment_level(int level_0_to_8, float pulse_mix = 1.0f) {
 }
 
 static void update_peak_gauge(float sig, uint32_t now_ms) {
-  static constexpr uint32_t kHoldMs = 2000;
+  static constexpr uint32_t kHoldMs = 3200;
   static constexpr uint32_t kDecayMs = 1000;
   static uint32_t s_last_ms = 0;
 
@@ -527,7 +675,6 @@ static void create_ui() {
   const int card_x = (s_panel_w - card_w) / 2;
   const int canvas_x = (card_w - gauge_size) / 2;
   const int canvas_y = 3;
-  const int label_y = canvas_y + gauge_size - 12;
 
   s_gauge_canvas_size = gauge_size;
 
@@ -539,6 +686,7 @@ static void create_ui() {
     lv_obj_set_pos(gauge.card, card_x, y);
     lv_obj_set_size(gauge.card, card_w, card_h);
     style_panel(gauge.card, make_rgb_u32(kGaugeSpecs[i].accent_dim_rgb));
+    lv_obj_add_flag(gauge.card, LV_OBJ_FLAG_OVERFLOW_VISIBLE);
 
     gauge.canvas = lv_canvas_create(gauge.card);
     lv_obj_set_pos(gauge.canvas, canvas_x, canvas_y);
@@ -554,28 +702,26 @@ static void create_ui() {
     lv_label_set_text(gauge.label, kGaugeSpecs[i].label);
     lv_obj_set_style_text_font(gauge.label, &lv_font_unscii_8, 0);
     lv_obj_set_style_text_color(gauge.label, kTextDim(), 0);
-    lv_obj_set_width(gauge.label, gauge_size - 8);
-    lv_obj_set_style_text_align(gauge.label, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_align(gauge.label, LV_ALIGN_TOP_MID, 0, label_y);
+    lv_obj_set_size(gauge.label, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
 
     gauge.value = lv_label_create(gauge.card);
     lv_label_set_text(gauge.value, "0");
     lv_obj_set_style_text_font(gauge.value, &lv_font_montserrat_20, 0);
     lv_obj_set_style_text_color(gauge.value, kTextBright(), 0);
-    lv_obj_set_size(gauge.value, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
-    lv_obj_align(gauge.value, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_width(gauge.value, kGaugeValueSlotW);
+    lv_obj_set_height(gauge.value, LV_SIZE_CONTENT);
+    lv_obj_set_style_text_align(gauge.value, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_obj_align(gauge.value, LV_ALIGN_BOTTOM_RIGHT, -kGaugeTextRightInset, -kGaugeTextBottomInset);
 
     gauge.status = lv_label_create(gauge.card);
     lv_label_set_text(gauge.status, "OK");
     lv_obj_set_style_text_font(gauge.status, &lv_font_unscii_8, 0);
-    lv_obj_set_style_text_color(gauge.status, kNeedleBlack(), 0);
-    lv_obj_set_style_bg_color(gauge.status, make_rgb_u32(kGaugeSpecs[i].accent_rgb), 0);
-    lv_obj_set_style_bg_opa(gauge.status, LV_OPA_COVER, 0);
-    lv_obj_set_style_pad_hor(gauge.status, 3, 0);
-    lv_obj_set_style_pad_ver(gauge.status, 1, 0);
-    lv_obj_set_style_radius(gauge.status, 3, 0);
-    lv_obj_set_pos(gauge.status, card_w - 23, 5);
-    lv_obj_add_flag(gauge.status, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_style_text_color(gauge.status, kTextDim(), 0);
+    lv_obj_set_style_bg_opa(gauge.status, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_pad_all(gauge.status, 0, 0);
+    lv_obj_align_to(gauge.status, gauge.canvas, LV_ALIGN_CENTER, 0, 0);
+
+    lv_obj_align(gauge.label, LV_ALIGN_BOTTOM_LEFT, kGaugeTextLeftInset, -kGaugeTextBottomInset - 4);
   }
 
   s_signal_panel = lv_obj_create(scr);
@@ -611,7 +757,10 @@ static void create_ui() {
   s_signal_inner_y = signal_inner_pad_y;
   s_signal_bar_h = signal_frame_h - (signal_inner_pad_y * 2);
   const int signal_inner_available_w = signal_frame_w - (signal_inner_pad_x * 2);
-  s_signal_bar_w = max(4, (signal_inner_available_w - (7 * s_signal_bar_gap)) / 8);
+  const int raw_bar_w = max(4, (signal_inner_available_w - (7 * s_signal_bar_gap)) / 8);
+  s_signal_bar_w = min(raw_bar_w, s_signal_bar_h);  // square for circles
+  s_signal_bar_h = s_signal_bar_w;                   // enforce square
+  s_signal_inner_y = max(signal_inner_pad_y, (signal_frame_h - s_signal_bar_h) / 2);
   s_signal_inner_w = (8 * s_signal_bar_w) + (7 * s_signal_bar_gap);
   s_signal_inner_x = signal_inner_pad_x + max(0, (signal_inner_available_w - s_signal_inner_w) / 2);
 
@@ -620,7 +769,7 @@ static void create_ui() {
     lv_obj_set_pos(s_signal_bars[i], s_signal_inner_x + i * (s_signal_bar_w + s_signal_bar_gap), s_signal_inner_y);
     lv_obj_set_size(s_signal_bars[i], s_signal_bar_w, s_signal_bar_h);
     lv_obj_clear_flag(s_signal_bars[i], LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_style_radius(s_signal_bars[i], 2, 0);
+    lv_obj_set_style_radius(s_signal_bars[i], LV_RADIUS_CIRCLE, 0);
     lv_obj_set_style_border_width(s_signal_bars[i], 1, 0);
     lv_obj_set_style_shadow_width(s_signal_bars[i], 0, 0);
     lv_obj_set_style_outline_width(s_signal_bars[i], 0, 0);
@@ -654,6 +803,8 @@ void pulseox_demo_lvgl_init(TFT_eSPI* tft, int panel_w, int panel_h, int panel_x
   s_swap_bytes = swap_bytes_for_push;
   s_swap_red_blue = swap_red_blue;
   s_ui_h = max(0, panel_h - kBottomStatusH);
+
+  pinMode(kSerialFrameTraceGateGpio, INPUT_PULLUP);
 
   if (s_inited) return;
   s_inited = true;
@@ -689,6 +840,7 @@ void pulseox_demo_lvgl_set_active(bool active) {
 }
 
 void pulseox_demo_lvgl_set_live_mode(bool live_mode) {
+  if (s_live_mode == live_mode) return;
   s_live_mode = live_mode;
   if (live_mode) {
     s_display_spo2 = s_live_spo2;
@@ -700,6 +852,7 @@ void pulseox_demo_lvgl_set_live_mode(bool live_mode) {
     s_peak_ms = 0;
     for (int i = 0; i < kGaugeCount; i++) {
       s_gauge_out_of_range[i] = false;
+      s_gauge_alert_fired[i] = false;
       s_gauge_alert_start_ms[i] = 0;
     }
     set_segment_level(0);
@@ -733,6 +886,7 @@ void pulseox_demo_lvgl_pump(uint32_t now_ms) {
     update_demo_readings(lv_tick_get());
   }
   lv_timer_handler();
+  serial_trace_emit_if_due(now_ms);
 }
 
 void pulseox_demo_lvgl_get_readings(float* out_spo2, float* out_hr, float* out_pi) {

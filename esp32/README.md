@@ -2,7 +2,9 @@
 
 Goal: a standalone ESP32 app that shows GK+ + pulse-ox values on a **76x284 TFT** (via **TFT_eSPI**) and later talks BLE to the devices.
 
-![Display demo](docs/display-demo.gif)
+| GK+ | Pulse Ox |
+|:---:|:--------:|
+| ![GK+ demo](docs/display-demo.gif) | ![PulseOx demo](docs/pulseox-demo.gif) |
 
 ## Status
 

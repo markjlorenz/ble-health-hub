@@ -2352,8 +2352,7 @@ static void drawOverlay() {
       tft.setTextDatum(TC_DATUM);
       tft.setTextSize(1);
       tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-      tft.drawString("Demo QR", kPanelW / 2, qrY + qrPx + 8);
-      tft.drawString("Sample setup view", kPanelW / 2, qrY + qrPx + 20);
+      tft.drawString("Scan to setup", kPanelW / 2, qrY + qrPx + 8);
     } else {
       // WiFiManager setup QR (join the portal AP).
       const int quiet = 2;
@@ -3391,6 +3390,14 @@ static void drawBootScreen() {
 
 
 void setup() {
+  // First priority: keep the panel dark and held in reset before any boot-time
+  // logging or delays, otherwise controller junk can be briefly visible.
+  setBacklight(false);
+#ifdef TFT_RST
+  pinMode(TFT_RST, OUTPUT);
+  digitalWrite(TFT_RST, LOW);
+#endif
+
   Serial.begin(115200);
   // Give the host time to attach a monitor so we don't miss boot logs.
   const uint32_t serialWaitMs = 1500;
@@ -3420,8 +3427,13 @@ void setup() {
 
   // Keep the panel dark until the controller is initialized and we've drawn
   // a known-black first frame.
-  setBacklight(false);
   delay(20);
+
+#ifdef TFT_RST
+  // Release the panel only once we're ready to start talking to it.
+  digitalWrite(TFT_RST, HIGH);
+  delay(20);
+#endif
 
   // Ensure the SPI peripheral is initialized before TFT_eSPI starts using
   // transactions. This avoids a null SPI bus handle on some ESP32-S3 setups.
@@ -3437,6 +3449,7 @@ void setup() {
 
   // Post-init sanity fill: keep it black (avoid white background flashes).
   Serial.println("post-init: fill black");
+  tft.fillScreen(TFT_BLACK);
   tft.fillScreen(TFT_BLACK);
   delay(80);
 

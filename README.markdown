@@ -2,9 +2,11 @@
 
 Reverse-engineering notes and tooling for BLE health devices.
 
-## ESP32 display demo
+## ESP32 display demos
 
-![ESP32 display demo](esp32/docs/display-demo.gif)
+| GK+ | Pulse Ox |
+|:---:|:--------:|
+| ![GK+ demo](esp32/docs/display-demo.gif) | ![PulseOx demo](esp32/docs/pulseox-demo.gif) |
 
 ## Device docs
 
