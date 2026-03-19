@@ -1,4 +1,5 @@
 #include "pulseox_demo_lvgl.h"
+#include "fb_trace.h"
 
 #include <lvgl.h>
 
@@ -28,12 +29,7 @@ static lv_disp_draw_buf_t s_draw_buf;
 static lv_disp_drv_t s_disp_drv;
 static lv_color_t* s_buf1 = nullptr;
 static lv_color_t* s_buf2 = nullptr;
-static constexpr bool kSerialFrameTraceEnabled = true;
-static constexpr int kSerialFrameTraceGateGpio = 7;
-static constexpr uint32_t kSerialFrameTraceIntervalMs = 300;
-static constexpr int kSerialTraceW = 38;
-static constexpr int kSerialTraceH = 68;
-static uint8_t s_serial_trace_buf[kSerialTraceW * kSerialTraceH] = {0};
+static uint8_t s_serial_trace_buf[kFbTraceW * kFbTraceH] = {0};
 static bool s_serial_trace_dirty = false;
 static bool s_serial_trace_banner_sent = false;
 static uint32_t s_serial_trace_last_emit_ms = 0;
@@ -114,7 +110,6 @@ static int s_signal_inner_w = 0;
 
 static void serial_trace_capture_area(const lv_area_t* area, const lv_color_t* color_p);
 static void serial_trace_emit_if_due(uint32_t now_ms);
-static bool serial_trace_gate_active();
 
 static lv_color_t make_rgb(uint8_t r, uint8_t g, uint8_t b) {
   if (s_swap_red_blue) {
@@ -244,44 +239,29 @@ static float ease_toward(float current, float target, uint32_t dt_ms) {
   return current + (target - current) * alpha;
 }
 
-static bool serial_trace_gate_active() {
-  if (!kSerialFrameTraceEnabled) return false;
-  return digitalRead(kSerialFrameTraceGateGpio) == LOW;
-}
-
 static uint8_t trace_palette_index(lv_color_t color) {
   uint8_t r = (uint8_t)((uint32_t)color.ch.red * 255u / 31u);
   const uint8_t g = (uint8_t)((uint32_t)color.ch.green * 255u / 63u);
   uint8_t b = (uint8_t)((uint32_t)color.ch.blue * 255u / 31u);
   if (s_swap_red_blue) { const uint8_t t = r; r = b; b = t; }
-  const uint8_t maxc = max(r, max(g, b));
-
-  if (maxc < 14u) return 0;
-  if (r > 180u && g < 95u && b < 95u) return 7;
-  if (r > 180u && g > 140u && b < 110u) return 6;
-  if (b > 140u && g > 120u) return 4;
-  if (g > 150u && r < 190u && b < 170u) return 5;
-  if (r > 215u && g > 215u && b > 215u) return 3;
-  if (r > 150u && g > 150u && b < 130u) return 8;
-  if (maxc > 95u) return 2;
-  return 1;
+  return fbTracePaletteIndex(r, g, b);
 }
 
 static void serial_trace_capture_area(const lv_area_t* area, const lv_color_t* color_p) {
-  if (!serial_trace_gate_active() || !area || !color_p || s_panel_w <= 0 || s_ui_h <= 0) return;
+  if (!fbTraceGateActive() || !area || !color_p || s_panel_w <= 0 || s_ui_h <= 0) return;
 
   const int w = area->x2 - area->x1 + 1;
   const int h = area->y2 - area->y1 + 1;
   for (int sy = 0; sy < h; sy++) {
     const int y = area->y1 + sy;
     if (y < 0 || y >= s_ui_h) continue;
-    const int ty = (y * kSerialTraceH) / s_ui_h;
-    const int trace_row = ty * kSerialTraceW;
+    const int ty = (y * kFbTraceH) / s_ui_h;
+    const int trace_row = ty * kFbTraceW;
     const int src_row = sy * w;
     for (int sx = 0; sx < w; sx++) {
       const int x = area->x1 + sx;
       if (x < 0 || x >= s_panel_w) continue;
-      const int tx = (x * kSerialTraceW) / s_panel_w;
+      const int tx = (x * kFbTraceW) / s_panel_w;
       s_serial_trace_buf[trace_row + tx] = trace_palette_index(color_p[src_row + sx]);
     }
   }
@@ -289,61 +269,26 @@ static void serial_trace_capture_area(const lv_area_t* area, const lv_color_t* c
 }
 
 static void serial_trace_emit_if_due(uint32_t now_ms) {
-  const bool gate_active = serial_trace_gate_active();
+  const bool gate_active = fbTraceGateActive();
   if (gate_active != s_serial_trace_last_gate_state) {
     s_serial_trace_last_gate_state = gate_active;
     s_serial_trace_banner_sent = false;
     s_serial_trace_dirty = false;
     s_serial_trace_last_emit_ms = now_ms;
-    Serial.printf("FBTRACE gpio=%d state=%s\n", kSerialFrameTraceGateGpio, gate_active ? "ON" : "OFF");
+    Serial.printf("FBTRACE gpio=%d state=%s\n", kFbTraceGpio, gate_active ? "ON" : "OFF");
   }
 
   if (!gate_active || !s_serial_trace_dirty) return;
-  if ((now_ms - s_serial_trace_last_emit_ms) < kSerialFrameTraceIntervalMs) return;
+  if ((now_ms - s_serial_trace_last_emit_ms) < kFbTraceIntervalMs) return;
   if (!Serial || Serial.availableForWrite() < 96) return;
 
   if (!s_serial_trace_banner_sent) {
     Serial.printf("FBMETA v3 gpio=%d active=LOW w=%d h=%d fmt=b64_4bpp\n",
-                  kSerialFrameTraceGateGpio, kSerialTraceW, kSerialTraceH);
+                  kFbTraceGpio, kFbTraceW, kFbTraceH);
     s_serial_trace_banner_sent = true;
   }
 
-  // Pack 4-bit-per-pixel (high nibble first), then base64 encode.
-  static constexpr int kTotalPx = kSerialTraceW * kSerialTraceH;           // 2584
-  static constexpr int kPackedBytes = (kTotalPx + 1) / 2;                  // 1292
-  static constexpr char b64[] =
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-  uint8_t packed[kPackedBytes];
-  for (int i = 0; i < kTotalPx; i += 2) {
-    const uint8_t hi = s_serial_trace_buf[i] & 0x0F;
-    const uint8_t lo = (i + 1 < kTotalPx) ? (s_serial_trace_buf[i + 1] & 0x0F) : 0;
-    packed[i >> 1] = (uint8_t)((hi << 4) | lo);
-  }
-
-  Serial.print("FB ");
-  Serial.print(s_serial_trace_seq++);
-  Serial.print(' ');
-
-  char line[96];
-  int used = 0;
-  for (int i = 0; i < kPackedBytes; i += 3) {
-    const uint8_t a = packed[i];
-    const uint8_t b = (i + 1 < kPackedBytes) ? packed[i + 1] : 0;
-    const uint8_t c = (i + 2 < kPackedBytes) ? packed[i + 2] : 0;
-    line[used++] = b64[(a >> 2) & 0x3F];
-    line[used++] = b64[((a << 4) | (b >> 4)) & 0x3F];
-    line[used++] = b64[((b << 2) | (c >> 6)) & 0x3F];
-    line[used++] = b64[c & 0x3F];
-    if (used >= (int)sizeof(line) - 4) {
-      Serial.write((const uint8_t*)line, used);
-      used = 0;
-    }
-  }
-  if (used > 0) {
-    Serial.write((const uint8_t*)line, used);
-  }
-  Serial.println();
+  fbTraceEmit(s_serial_trace_buf, s_serial_trace_seq);
 
   s_serial_trace_dirty = false;
   s_serial_trace_last_emit_ms = now_ms;
@@ -804,7 +749,7 @@ void pulseox_demo_lvgl_init(TFT_eSPI* tft, int panel_w, int panel_h, int panel_x
   s_swap_red_blue = swap_red_blue;
   s_ui_h = max(0, panel_h - kBottomStatusH);
 
-  pinMode(kSerialFrameTraceGateGpio, INPUT_PULLUP);
+  pinMode(kFbTraceGpio, INPUT_PULLUP);
 
   if (s_inited) return;
   s_inited = true;

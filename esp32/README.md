@@ -146,9 +146,11 @@ These match the defaults in `esp32/include/User_Setup.h`:
 - Display `VCC` → `3V3`
 - Display `GND` → `GND`
 
-Demo gate strap:
+Demo gate straps:
 
-- `GPIO5` → `GND` (optional) to enable the demo loop; leave unconnected for normal boot (LOADING only).
+- `GPIO5` → `GND` (optional) to enable the GK+ demo loop; leave unconnected for normal boot (CONNECTING only).
+- `GPIO6` → `GND` (optional) to enable the PulseOx demo.
+- `GPIO7` → `GND` (optional) to enable the framebuffer serial trace.
 
 ## Known-good TFT config (76x284 narrow panel)
 
@@ -197,6 +199,67 @@ TFT_eSPI::getSPIinstance().begin(TFT_SCLK, TFT_MISO, TFT_MOSI, (TFT_CS >= 0) ? T
 ```
 
 If you remove that line and see boot-time instability, put it back.
+
+## Serial framebuffer trace
+
+The firmware can stream a low-resolution snapshot of the display over serial for offline inspection. This lets the AI verify what's actually on screen after every flash — without needing a camera.
+
+### How it works
+
+1. A GPIO pin (currently **GPIO7**, configured in `src/fb_trace.h` as `kFbTraceGpio`) acts as an active-low gate.
+2. When the pin is grounded, the firmware quantises each frame to a **38×68 4-bit palette** and emits it as a base64-encoded `FB <seq> <payload>` line at 115200 baud.
+3. Both the **LVGL PulseOx renderer** and the **TFT_eSPI static screens** (NO WIFI, LOW BATTERY) share the same trace infrastructure via `fb_trace.h`.
+
+### Palette
+
+| Index | Name | Meaning |
+|:-----:|:----:|:--------|
+| 0 | BLK | Black / off |
+| 1 | BG  | Near-black background |
+| 2 | DIM | Gray / dim content |
+| 3 | WHT | White |
+| 4 | CYN | Cyan (SpO2 accent) |
+| 5 | GRN | Green (HR accent) |
+| 6 | AMB | Amber (PI accent) |
+| 7 | RED | Red (alerts, banners) |
+| 8 | YEL | Yellow |
+
+### AI-assisted workflow
+
+After every build-and-flash, the AI runs `tmp/inspect_demo_frames.py` with the appropriate flags for the test scenario:
+
+| Scenario | Command | Pins required |
+|:---------|:--------|:--------------|
+| GK+ demo screens | `--need-gk --need-trace` | GPIO5 + GPIO7 |
+| PulseOx demo | `--need-pulseox --need-trace` | GPIO6 + GPIO7 |
+| Static screens only (NO WIFI, LOW BATTERY) | `--need-gk --need-trace` | GPIO5 + GPIO7 |
+
+The script:
+
+1. **Sends a `PINS?` query** over serial to ask the firmware for current pin states. The firmware responds with all three pin states, so already-grounded pins are detected instantly without requiring them to be reconnected.
+2. **Reports which pins are grounded** and which are missing:
+
+   ```
+   Required pins: GPIO5, GPIO7
+     Pin status: GPIO5=OK | GPIO7=NOT grounded
+     >>> Please ground GPIO7 (FB trace)
+   ```
+
+3. **Blocks until all required pins are grounded**, then captures for 40 seconds and renders ASCII art.
+
+### Wiring
+
+| Pin | Purpose | Ground to enable |
+|:---:|:--------|:-----------------|
+| GPIO5 | GK+ demo cycle (CONNECTING → NOT KETOSIS → LOW → MID → HIGH → NO WIFI → LOW BATTERY) | GND |
+| GPIO6 | PulseOx demo | GND |
+| GPIO7 | Framebuffer serial trace | GND |
+
+All pins are configured with `INPUT_PULLUP` — leaving them unconnected disables their function (no performance cost).
+
+### Changing the gate pins
+
+Edit `kFbTraceGpio` in `esp32/src/fb_trace.h` for the trace pin. The demo gate pins (`kGkDemoGateGpio` on GPIO5, `kPulseOxDemoGateGpio` on GPIO6) are in `main.cpp`.
 
 ## Next
 

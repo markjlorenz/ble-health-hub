@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <TFT_eSPI.h>
+#include "fb_trace.h"
 
 #include <WiFi.h>
 #include <WiFiSTA.h>
@@ -160,6 +161,22 @@ static bool isPulseOxDemoGateActive();
 static bool isAnyDemoGateActive();
 static bool isDemoNoWifiScreen();
 static void setBleConnected(bool v);
+
+// ---------- Serial frame trace for static screens (GPIO7 gated) ----------
+// Reads pixels back from gPanelFxSprite after a static screen has been drawn,
+// quantises with the shared palette, and emits via the common FB protocol.
+static uint32_t sMainTraceSeq = 0;
+
+static uint8_t mainTracePaletteIndex(uint16_t rgb565) {
+  uint8_t r = (uint8_t)(((rgb565 >> 11) & 0x1F) * 255u / 31u);
+  const uint8_t g = (uint8_t)(((rgb565 >> 5) & 0x3F) * 255u / 63u);
+  uint8_t b = (uint8_t)((rgb565 & 0x1F) * 255u / 31u);
+  if (kSwapRedBlueInConvert) { const uint8_t t = r; r = b; b = t; }
+  return fbTracePaletteIndex(r, g, b);
+}
+
+// Forward declaration – body after gPanelFxSprite is declared.
+static void emitStaticScreenTrace();
 
 static inline uint16_t rgba8888ToRgb565(uint32_t argb) {
   // RLottie uses ARGB32 pixels.
@@ -575,6 +592,25 @@ static void initPanelFxSpriteOnce() {
   }
 }
 
+// ---------- emitStaticScreenTrace (body – after gPanelFxSprite) ----------
+static void emitStaticScreenTrace() {
+  if (!fbTraceGateActive()) return;
+  initPanelFxSpriteOnce();
+  if (!gPanelFxSpriteOk) return;
+
+  uint8_t traceBuf[kFbTraceW * kFbTraceH];
+  for (int ty = 0; ty < kFbTraceH; ty++) {
+    const int sy = (ty * kPanelH) / kFbTraceH;
+    for (int tx = 0; tx < kFbTraceW; tx++) {
+      const int sx = (tx * kPanelW) / kFbTraceW;
+      const uint16_t px = gPanelFxSprite.readPixel(sx, sy);
+      traceBuf[ty * kFbTraceW + tx] = mainTracePaletteIndex(px);
+    }
+  }
+
+  fbTraceEmit(traceBuf, sMainTraceSeq);
+}
+
 enum LabelFxState {
   kLabelFxNone = 0,
   kLabelFxExpand = 1,
@@ -618,6 +654,7 @@ static TaskHandle_t gGkTask = nullptr;
 
 static bool gShowLoading = false;
 static bool gShowNoWifi = false;
+static bool gShowLowBattery = false;
 static bool gShowPulseOx = false;
 static String gTopStatus = "";
 
@@ -2323,8 +2360,79 @@ static void setLoopToLogLoading() {
 }
 
 static void drawOverlay() {
+  if (gShowLowBattery) {
+    setupKetosisLabelColorsOnce();
+    initPanelFxSpriteOnce();
+
+    // Draw into sprite for trace capture, then push to TFT.
+    TFT_eSprite* spr = gPanelFxSpriteOk ? &gPanelFxSprite : nullptr;
+    // Also draw directly to TFT as fallback / final output.
+    applyPanelViewport();
+    tft.setTextDatum(TL_DATUM);
+    tft.setTextSize(1);
+    tft.fillRect(0, 0, kPanelW, kPanelH, TFT_BLACK);
+    if (spr) { spr->fillSprite(TFT_BLACK); }
+
+    // Red banner
+    const int bannerH = 16;
+    tft.fillRect(0, 0, kPanelW, bannerH, gKetosisRed565);
+    tft.setTextColor(TFT_WHITE, gKetosisRed565);
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextSize(1);
+    tft.drawString("LOW BATTERY", kPanelW / 2, bannerH / 2);
+    if (spr) {
+      spr->fillRect(0, 0, kPanelW, bannerH, gKetosisRed565);
+      spr->setTextColor(TFT_WHITE, gKetosisRed565);
+      spr->setTextDatum(MC_DATUM);
+      spr->setTextSize(1);
+      spr->drawString("LOW BATTERY", kPanelW / 2, bannerH / 2);
+    }
+
+    // Battery icon: 40x22 body + 4x10 terminal nub, centered
+    const int bw = 40, bh = 22, nubW = 4, nubH = 10;
+    const int bx = (kPanelW - bw - nubW) / 2;
+    const int by = (kPanelH - bannerH - 12) / 2 + bannerH - bh / 2;
+    const uint16_t outlineColor = rgb888To565(0xCC, 0xCC, 0xCC);
+    const uint16_t fillColor = gKetosisRed565;
+    // Body outline
+    tft.drawRect(bx, by, bw, bh, outlineColor);
+    tft.drawRect(bx + 1, by + 1, bw - 2, bh - 2, outlineColor);
+    // Positive terminal nub
+    tft.fillRect(bx + bw, by + (bh - nubH) / 2, nubW, nubH, outlineColor);
+    // Red fill: ~15% charge (single sliver on the left)
+    const int fillInset = 3;
+    const int fillH = bh - fillInset * 2;
+    const int fillMaxW = bw - fillInset * 2;
+    const int fillW = max(3, fillMaxW * 15 / 100);
+    tft.fillRect(bx + fillInset, by + fillInset, fillW, fillH, fillColor);
+    if (spr) {
+      spr->drawRect(bx, by, bw, bh, outlineColor);
+      spr->drawRect(bx + 1, by + 1, bw - 2, bh - 2, outlineColor);
+      spr->fillRect(bx + bw, by + (bh - nubH) / 2, nubW, nubH, outlineColor);
+      spr->fillRect(bx + fillInset, by + fillInset, fillW, fillH, fillColor);
+    }
+
+    // Warning text
+    tft.setTextDatum(TC_DATUM);
+    tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+    tft.drawString("Charge device", kPanelW / 2, by + bh + 14);
+    if (spr) {
+      spr->setTextDatum(TC_DATUM);
+      spr->setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+      spr->drawString("Charge device", kPanelW / 2, by + bh + 14);
+    }
+
+    tft.setTextDatum(TL_DATUM);
+    drawStatusDots();
+    emitStaticScreenTrace();
+    return;
+  }
+
   if (gShowNoWifi) {
     const bool demoNoWifi = isDemoNoWifiScreen();
+
+    initPanelFxSpriteOnce();
+    TFT_eSprite* spr = gPanelFxSpriteOk ? &gPanelFxSprite : nullptr;
 
     // Full-screen static screen.
     setupKetosisLabelColorsOnce();
@@ -2332,6 +2440,7 @@ static void drawOverlay() {
     tft.setTextDatum(TL_DATUM);
     tft.setTextSize(1);
     tft.fillRect(0, 0, kPanelW, kPanelH, TFT_BLACK);
+    if (spr) { spr->fillSprite(TFT_BLACK); }
 
     // Title banner (like the HIGH KETOSIS bar, but at the top)
     const int bannerH = 16;
@@ -2340,6 +2449,13 @@ static void drawOverlay() {
     tft.setTextDatum(MC_DATUM);
     tft.setTextSize(1);
     tft.drawString("NO WIFI", kPanelW / 2, bannerH / 2);
+    if (spr) {
+      spr->fillRect(0, 0, kPanelW, bannerH, gKetosisRed565);
+      spr->setTextColor(TFT_WHITE, gKetosisRed565);
+      spr->setTextDatum(MC_DATUM);
+      spr->setTextSize(1);
+      spr->drawString("NO WIFI", kPanelW / 2, bannerH / 2);
+    }
 
     if (demoNoWifi) {
       const int quiet = 2;
@@ -2370,6 +2486,7 @@ static void drawOverlay() {
 
     tft.setTextDatum(TL_DATUM);
     drawStatusDots();
+    emitStaticScreenTrace();
     return;
   }
 
@@ -2866,6 +2983,7 @@ static void applyUiStepVisual(int step) {
   // so RLottie setValue() calls are serialized.
   gShowLoading = false;
   gShowNoWifi = false;
+  gShowLowBattery = false;
   gShowPulseOx = false;
   gSuppressStatusTime = false;
   gLabelFxState = kLabelFxNone;
@@ -2929,7 +3047,7 @@ static void applyUiStepVisual(int step) {
     }
     case 4: {
       gShowLoading = true;
-      gTopStatus = "LOADING";
+      gTopStatus = "CONNECTING";
       gKetosisLabel = "";
       gKetosisLabelBg = TFT_BLACK;
       gKetosisLabelFg = TFT_WHITE;
@@ -2954,6 +3072,15 @@ static void applyUiStepVisual(int step) {
       gShowPulseOx = true;
       gSuppressStatusTime = true;
       gTopStatus = "";
+      gKetosisLabel = "";
+      gKetosisLabelBg = TFT_BLACK;
+      gKetosisLabelFg = TFT_WHITE;
+      setAllLayersOpacityPct(0.0f);
+      break;
+    }
+    case 8: {
+      gShowLowBattery = true;
+      gTopStatus = "LOW BATTERY";
       gKetosisLabel = "";
       gKetosisLabelBg = TFT_BLACK;
       gKetosisLabelFg = TFT_WHITE;
@@ -3020,6 +3147,10 @@ static void applyDemoStep(int step) {
       // Pulse ox demo has its own visuals; metrics are drawn by LVGL.
       break;
     }
+    case 8: {
+      // Visuals handled by applyUiStepVisual().
+      break;
+    }
     default:
       break;
   }
@@ -3043,6 +3174,25 @@ static void renderTask(void* /*param*/) {
 
     if (!gLottieReady && (now - gLastLottieInitAttemptMs) > 3000) {
       initLottie();
+    }
+
+    // Serial command: respond to "PINS?" with current gate states.
+    while (Serial.available()) {
+      static char sCmdBuf[16];
+      static int sCmdLen = 0;
+      char ch = (char)Serial.read();
+      if (ch == '\n' || ch == '\r') {
+        sCmdBuf[sCmdLen] = '\0';
+        if (strcmp(sCmdBuf, "PINS?") == 0) {
+          Serial.printf("PINS: GK(GPIO%d)=%s  PulseOx(GPIO%d)=%s  FBTrace(GPIO%d)=%s\n",
+                        kGkDemoGateGpio, isGkDemoGateActive() ? "ON" : "OFF",
+                        kPulseOxDemoGateGpio, isPulseOxDemoGateActive() ? "ON" : "OFF",
+                        kFbTraceGpio, fbTraceGateActive() ? "ON" : "OFF");
+        }
+        sCmdLen = 0;
+      } else if (sCmdLen < (int)sizeof(sCmdBuf) - 1) {
+        sCmdBuf[sCmdLen++] = ch;
+      }
     }
 
     const bool gkGate = isGkDemoGateActive();
@@ -3076,9 +3226,9 @@ static void renderTask(void* /*param*/) {
         if (gDemoStartMs == 0) {
           gDemoStartMs = now;
         }
-        static constexpr int kDemoSteps = 6;
-        // GK+ demo cycle: Loading -> Not -> Low -> Mid -> High -> WiFi
-        static constexpr int kDemoOrder[kDemoSteps] = {4, 0, 1, 2, 3, 5};
+        static constexpr int kDemoSteps = 7;
+        // GK+ demo cycle: Loading -> Not -> Low -> Mid -> High -> WiFi -> LowBatt
+        static constexpr int kDemoOrder[kDemoSteps] = {4, 0, 1, 2, 3, 5, 8};
         const int idx = (int)(((now - gDemoStartMs) / kDemoStepMs) % kDemoSteps);
         const int nextStep = kDemoOrder[idx];
         if (nextStep != appliedStep) {
@@ -3124,7 +3274,7 @@ static void renderTask(void* /*param*/) {
     }
 
     if (gLottieReady) {
-      if (gShowNoWifi) {
+      if (gShowNoWifi || gShowLowBattery) {
         // Static screen: avoid continuously overwriting it with animation pushes.
         if (gOverlayDirty) {
           gOverlayDirty = false;
