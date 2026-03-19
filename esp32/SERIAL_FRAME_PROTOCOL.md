@@ -2,7 +2,7 @@
 
 The ESP32 firmware can emit a low-resolution snapshot of the display over the serial port. This allows an LLM (or any automated tool) to **see** the screen contents without a camera, enabling a closed-loop edit → flash → inspect workflow.
 
-![PulseOx demo captured via serial trace](docs/pulseox-capture.gif)
+![PulseOx demo captured via serial trace](../docs/pulseox-capture.gif)
 
 ## Hardware gate
 

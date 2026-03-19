@@ -4,7 +4,9 @@ Goal: a standalone ESP32 app that shows GK+ + pulse-ox values on a **76x284 TFT*
 
 | GK+ | Pulse Ox |
 |:---:|:--------:|
-| ![GK+ demo](docs/display-demo.gif) | ![PulseOx demo](docs/pulseox-demo.gif) |
+| ![GK+ demo](../docs/display-demo.gif) | ![PulseOx demo](../docs/pulseox-demo.gif) |
+
+![Valet](../docs/valet.png)
 
 ## Status
 

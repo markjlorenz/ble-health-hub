@@ -6,7 +6,9 @@ Reverse-engineering notes and tooling for BLE health devices.
 
 | GK+ | Pulse Ox |
 |:---:|:--------:|
-| ![GK+ demo](esp32/docs/display-demo.gif) | ![PulseOx demo](esp32/docs/pulseox-demo.gif) |
+| ![GK+ demo](docs/display-demo.gif) | ![PulseOx demo](docs/pulseox-demo.gif) |
+
+![Valet](docs/valet.png)
 
 ## Device docs
 
