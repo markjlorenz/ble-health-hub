@@ -10,6 +10,8 @@ Reverse-engineering notes and tooling for BLE health devices.
 
 ![Valet](docs/valet.png)
 
+ESP32 firmware notes (including deep-sleep + touch wake): [esp32/README.md](esp32/README.md)
+
 ## Device docs
 
 - Pulse oximeter (PO3): [PULSE_OX_README.markdown](PULSE_OX_README.markdown)

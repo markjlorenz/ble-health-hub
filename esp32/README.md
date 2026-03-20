@@ -148,11 +148,52 @@ These match the defaults in `esp32/include/User_Setup.h`:
 - Display `VCC` → `3V3`
 - Display `GND` → `GND`
 
+Notes:
+
+- `TFT_MISO` is a **dummy** input pin (display is write-only); default is `GPIO8` (leave it unwired).
+- `GPIO13` is reserved for **touch wake** by default.
+
 Demo gate straps:
 
 - `GPIO5` → `GND` (optional) to enable the GK+ demo loop; leave unconnected for normal boot (CONNECTING only).
 - `GPIO6` → `GND` (optional) to enable the PulseOx demo.
 - `GPIO7` → `GND` (optional) to enable the framebuffer serial trace.
+
+## Sleep / Wake
+
+The firmware uses **deep sleep** to minimize power draw when idle, and wakes via a **touch sensor** (built-in ESP32 touch peripheral).
+
+### Wake pin
+
+- Default wake pin: **GPIO13** (touch-capable on ESP32-S3)
+- Override at build time: add `-D WAKE_TOUCH_GPIO=<gpio>` to your PlatformIO build flags
+- The wake GPIO must be **touch-capable** for your SoC. (ESP32-S3 touch-capable GPIOs include: 0, 2, 4, 12, 13, 14, 15, 27, 32, 33.)
+
+Touch tuning:
+
+- If the device wakes up unexpectedly, increase the touch wake threshold.
+- Override at build time with `-D WAKE_TOUCH_THRESHOLD=<n>`.
+	- ESP32-S2/S3: `<n>` is an **increment above baseline** (firmware converts to an absolute sleep threshold internally).
+	- ESP32: `<n>` is an **absolute raw threshold**.
+
+Auto-calibration note:
+
+- After a touch-wake, the firmware uses a short settle window and treats baseline as the minimum observed value so it doesn't calibrate while your finger is still on the pad.
+
+### Sleep rules
+
+Sleep is **disabled** while demo stages are playing (i.e. any demo gate strap is active).
+
+Otherwise, the device enters deep sleep after:
+
+- **2 minutes** while waiting for **WiFi setup** (WiFiManager portal is active / QR setup screen)
+- **1 minute** while waiting for a **Bluetooth connection** (CONNECTING screen and BLE not connected)
+- **30 seconds** while **showing a GK+ or PulseOx reading**
+
+Notes:
+
+- Deep sleep is a full suspend; wake behaves like a reboot. The firmware prints the wake cause on boot (`WAKE: cause=...`).
+- Touch thresholds are estimated from an initial baseline and may need tuning depending on your electrode size/placement and enclosure.
 
 ## Known-good TFT config (76x284 narrow panel)
 

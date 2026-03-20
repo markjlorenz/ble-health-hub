@@ -63,7 +63,8 @@
 // The display is write-only; MISO is not wired. On ESP32-S3, TFT_eSPI may
 // rewrite TFT_MISO to TFT_MOSI when set to -1, which can break SPI init.
 // Provide a valid (but unwired) dummy input pin instead.
-#define TFT_MISO 13
+// NOTE: keep this off the touch-wake pin.
+#define TFT_MISO 8
 
 // Chip select:
 // If CS is tied to GND (common on some breakouts) or not wired, set TFT_CS=-1.

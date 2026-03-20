@@ -40,6 +40,16 @@ extern "C" {
 
 #include <rlottie.h>
 
+#if __has_include(<esp_sleep.h>)
+extern "C" {
+#include <esp_sleep.h>
+}
+#endif
+
+#if __has_include(<esp32-hal-touch.h>)
+#include <esp32-hal-touch.h>
+#endif
+
 #include "generated/flame_lottie.h"
 
 #include "pulseox_demo_lvgl.h"
@@ -76,6 +86,27 @@ static constexpr uint32_t kDemoStepMs = 4500;
 // - GPIO6: Pulse Ox demo screen (LVGL)
 static constexpr int kGkDemoGateGpio = 5;
 static constexpr int kPulseOxDemoGateGpio = 6;
+
+// Deep sleep wake source.
+// NOTE: This must be a touch-capable GPIO for your target (ESP32-S3 has many).
+// Override at build time with `-D WAKE_TOUCH_GPIO=<gpio>` if needed.
+#ifndef WAKE_TOUCH_GPIO
+#define WAKE_TOUCH_GPIO 13
+#endif
+static constexpr int kWakeTouchGpio = WAKE_TOUCH_GPIO;
+
+// Touch wake threshold.
+// - ESP32: absolute raw threshold (lower triggers)
+// - ESP32-S2/S3: increment above baseline (higher triggers)
+// Set to 0 to auto-select.
+#ifndef WAKE_TOUCH_THRESHOLD
+#define WAKE_TOUCH_THRESHOLD 0
+#endif
+
+// Sleep rules (per user spec).
+static constexpr uint32_t kSleepAfterWifiSetupMs = 2u * 60u * 1000u;
+static constexpr uint32_t kSleepAfterBleWaitMs = 1u * 60u * 1000u;
+static constexpr uint32_t kSleepAfterShowingReadingMs = 30u * 1000u;
 
 // Physical visible window is 76px wide.
 static constexpr int kPanelW = 76;
@@ -161,6 +192,24 @@ static bool isPulseOxDemoGateActive();
 static bool isAnyDemoGateActive();
 static bool isDemoNoWifiScreen();
 static void setBleConnected(bool v);
+static void setBacklight(bool on);
+static void setBacklightRaw(bool levelHigh);
+
+enum SleepPolicyState : uint8_t {
+  kSleepDisabled = 0,
+  kSleepWaitingWifiSetup = 1,
+  kSleepWaitingBle = 2,
+  kSleepShowingReading = 3,
+  kSleepNone = 4,
+};
+
+static volatile bool gTouchWakeConfigured = false;
+static volatile uint32_t gTouchWakeThreshold = 0;
+
+static SleepPolicyState computeSleepPolicyState();
+static uint32_t sleepTimeoutForPolicyState(SleepPolicyState st);
+static void configureTouchWakeIfNeeded();
+static void enterDeepSleepNow(const char* why);
 
 // ---------- Serial frame trace for static screens (GPIO7 gated) ----------
 // Reads pixels back from gPanelFxSprite after a static screen has been drawn,
@@ -707,6 +756,159 @@ static void onWmApStarted(WiFiManager* wm) {
   gForceNoWifiScreen = true;
   gOverlayDirty = true;
   Serial.printf("WIFI: portal started ssid='%s'\n", gPortalSsid);
+}
+
+static SleepPolicyState computeSleepPolicyState() {
+  // Never sleep while demo stages are playing.
+  if (kDemoMode && isAnyDemoGateActive()) {
+    return kSleepDisabled;
+  }
+
+  // Waiting for WiFi setup: WiFiManager portal has started and we show QR.
+  if (gForceNoWifiScreen) {
+    return kSleepWaitingWifiSetup;
+  }
+
+  // Determine current UI step (best-effort snapshot).
+  int req = 4;
+  portENTER_CRITICAL(&gUiMux);
+  req = gUiRequestedStep;
+  portEXIT_CRITICAL(&gUiMux);
+
+  // Waiting for BLE connection: CONNECTING stage with BLE not connected.
+  if (req == 4 && !gBleConnected) {
+    return kSleepWaitingBle;
+  }
+
+  // Showing readings to the user.
+  if (req == 7 || req == 0 || req == 1 || req == 2 || req == 3 || req == 6) {
+    return kSleepShowingReading;
+  }
+
+  return kSleepNone;
+}
+
+static uint32_t sleepTimeoutForPolicyState(SleepPolicyState st) {
+  switch (st) {
+    case kSleepWaitingWifiSetup: return kSleepAfterWifiSetupMs;
+    case kSleepWaitingBle: return kSleepAfterBleWaitMs;
+    case kSleepShowingReading: return kSleepAfterShowingReadingMs;
+    default: return 0;
+  }
+}
+
+static void configureTouchWakeIfNeeded() {
+  if (gTouchWakeConfigured) return;
+
+#if __has_include(<esp_sleep.h>) && __has_include(<esp32-hal-touch.h>)
+#if SOC_TOUCH_SENSOR_NUM > 0
+  // Prime touch hardware and estimate a baseline.
+  // NOTE: Arduino-ESP32 semantics differ by SoC:
+  // - ESP32: touchRead falls when touched; threshold is an absolute raw value.
+  // - ESP32-S2/S3: touchRead rises when touched; threshold is an increment.
+  touch_value_t baseline = 0;
+  touch_value_t maxSeen = 0;
+  {
+    // On touch wake, the user may still be touching the pad during boot.
+    // Use a settle window and treat baseline as the *minimum* observed value
+    // (best proxy for "untouched"), so we don't calibrate against a touched pad.
+    uint32_t settleMs = 250;
+#if __has_include(<esp_sleep.h>)
+    if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TOUCHPAD) {
+      settleMs = 1200;
+    }
+#endif
+    touch_value_t minSeen = (touch_value_t)~(touch_value_t)0;
+    const uint32_t t0 = millis();
+    while ((millis() - t0) < settleMs) {
+      const touch_value_t v = touchRead((uint8_t)kWakeTouchGpio);
+      if (v < minSeen) minSeen = v;
+      if (v > maxSeen) maxSeen = v;
+      delay(5);
+    }
+    baseline = (minSeen == (touch_value_t)~(touch_value_t)0) ? (touch_value_t)0 : minSeen;
+  }
+
+  touch_value_t thr = (touch_value_t)WAKE_TOUCH_THRESHOLD;
+
+  if (thr == (touch_value_t)0) {
+#if defined(SOC_TOUCH_VERSION_2)
+    // ESP32-S2/S3: Arduino's touchSleepWakeUpEnable() ultimately calls
+    // touch_pad_sleep_set_threshold(), which expects an *absolute* threshold.
+    // We treat our threshold as an *increment* and convert: abs = baseline + inc.
+    // Make the increment noise-aware to avoid spurious wakes if the pad is floating.
+    const touch_value_t noiseDelta = (maxSeen > baseline) ? (touch_value_t)(maxSeen - baseline) : (touch_value_t)0;
+
+    // Heuristic: require a bump comfortably above observed noise.
+    // - at least 1/8 of baseline
+    // - at least 4x the observed noise delta
+    // - at least a small absolute floor
+    touch_value_t incA = (touch_value_t)(baseline / (touch_value_t)8);
+    touch_value_t incB = (touch_value_t)(noiseDelta * (touch_value_t)4);
+    touch_value_t incC = (touch_value_t)300;  // floor
+    touch_value_t inc = incA;
+    if (incB > inc) inc = incB;
+    if (incC > inc) inc = incC;
+    if (inc < (touch_value_t)1) inc = (touch_value_t)1;
+
+    // If caller provided WAKE_TOUCH_THRESHOLD, treat it as an increment.
+    if ((touch_value_t)WAKE_TOUCH_THRESHOLD != (touch_value_t)0) {
+      inc = (touch_value_t)WAKE_TOUCH_THRESHOLD;
+    }
+
+    // Convert to absolute threshold.
+    const uint32_t thrAbs32 = (uint32_t)baseline + (uint32_t)inc;
+    thr = (touch_value_t)thrAbs32;
+
+    Serial.printf("SLEEP: touch noise baseline=%u max=%u noiseDelta=%u inc=%u thrAbs=%u\n",
+            (unsigned)baseline, (unsigned)maxSeen, (unsigned)noiseDelta, (unsigned)inc, (unsigned)thrAbs32);
+#else
+    // ESP32: threshold is an absolute raw value (lower triggers).
+    thr = (touch_value_t)((uint64_t)baseline * 80u / 100u);  // 80% of baseline
+    if (thr < (touch_value_t)1) thr = (touch_value_t)1;
+#endif
+  }
+
+  gTouchWakeThreshold = (uint32_t)thr;
+  touchSleepWakeUpEnable((uint8_t)kWakeTouchGpio, (touch_value_t)thr);
+  (void)esp_sleep_enable_touchpad_wakeup();
+  gTouchWakeConfigured = true;
+  Serial.printf("SLEEP: touch wake enabled gpio=%d baseline=%u thr=%u\n", kWakeTouchGpio, (unsigned)baseline, (unsigned)thr);
+#else
+  Serial.println("SLEEP: touch sensors not supported on this target");
+  gTouchWakeConfigured = true;
+#endif
+#else
+  Serial.println("SLEEP: touch wake not available in this build");
+  gTouchWakeConfigured = true;
+#endif
+}
+
+static void enterDeepSleepNow(const char* why) {
+#if __has_include(<esp_sleep.h>)
+  Serial.printf("SLEEP: entering deep sleep (%s)\n", why ? why : "");
+  Serial.flush();
+
+  // Minimal power-down prep.
+  setBacklight(false);
+#ifdef TFT_RST
+  pinMode(TFT_RST, OUTPUT);
+  digitalWrite(TFT_RST, LOW);
+#endif
+
+  // Stop Wi-Fi to reduce draw before sleep.
+  // IMPORTANT: do NOT erase stored credentials here.
+  // `eraseap=true` would clear the STA config in NVS, preventing reconnect on wake.
+  WiFi.disconnect(true, false);
+  WiFi.mode(WIFI_OFF);
+
+  // Ensure wake source is armed.
+  configureTouchWakeIfNeeded();
+
+  esp_deep_sleep_start();
+#else
+  (void)why;
+#endif
 }
 
 static void drawQrCodeFromText(const char* text, int x0, int y0, int scale, int quiet) {
@@ -3560,6 +3762,13 @@ void setup() {
   Serial.println();
   Serial.println("--- boot ---");
 
+#if __has_include(<esp_sleep.h>)
+  {
+    const esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+    Serial.printf("WAKE: cause=%d\n", (int)cause);
+  }
+#endif
+
   // Demo gate inputs (active-low). Ground the pin to enable the respective demo.
   pinMode(kGkDemoGateGpio, INPUT_PULLUP);
   pinMode(kPulseOxDemoGateGpio, INPUT_PULLUP);
@@ -3572,6 +3781,9 @@ void setup() {
 
   setupKetosisLabelColorsOnce();
   updatePortalQrPayload();
+
+  // Configure touch wake early so we can deep sleep from any state.
+  configureTouchWakeIfNeeded();
 
   printDisplayConfig();
 
@@ -3693,6 +3905,29 @@ void loop() {
     return;
   }
 
-  // Rendering runs in renderTask(). Keep loop() minimal.
-  delay(1000);
+  // Rendering runs in renderTask(). loop() implements the sleep rules.
+  static SleepPolicyState sLastPolicy = kSleepNone;
+  static uint32_t sPolicySinceMs = 0;
+
+  const uint32_t now = millis();
+  const SleepPolicyState st = computeSleepPolicyState();
+  const uint32_t timeoutMs = sleepTimeoutForPolicyState(st);
+
+  if (st != sLastPolicy) {
+    sLastPolicy = st;
+    sPolicySinceMs = now;
+  }
+
+  if (timeoutMs > 0 && st != kSleepDisabled) {
+    const uint32_t elapsed = (now >= sPolicySinceMs) ? (now - sPolicySinceMs) : 0;
+    if (elapsed >= timeoutMs) {
+      const char* why = (st == kSleepWaitingWifiSetup) ? "wifi setup timeout"
+                        : (st == kSleepWaitingBle) ? "ble wait timeout"
+                        : (st == kSleepShowingReading) ? "reading timeout"
+                        : "timeout";
+      enterDeepSleepNow(why);
+    }
+  }
+
+  delay(250);
 }
