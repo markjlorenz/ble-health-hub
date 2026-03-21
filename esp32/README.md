@@ -12,7 +12,10 @@ Goal: a standalone ESP32 app that shows GK+ + pulse-ox values on a **76x284 TFT*
 
 - Current milestone: **display bring-up + animation** (full-screen Lottie playback)
 - GK+ BLE auto-connect + latest-reading download is working (connects to a fixed meter MAC).
-- Demo/test screens are gated behind a strap: **GPIO5 to GND enables demo mode**; if not grounded, the firmware shows **LOADING only**.
+- Demo/test screens are gated behind straps:
+	- **GPIO5 → GND** enables the GK+ demo loop
+	- **GPIO6 → GND** enables the PulseOx demo
+	- **GPIO4 → GND** enables the utility carousel (NO WIFI / LOW BATTERY / GOODBYE)
 
 ### GK+ MAC address
 
@@ -155,6 +158,7 @@ Notes:
 
 Demo gate straps:
 
+- `GPIO4` → `GND` (optional) to enable the utility demo carousel (NO WIFI / LOW BATTERY / GOODBYE).
 - `GPIO5` → `GND` (optional) to enable the GK+ demo loop; leave unconnected for normal boot (CONNECTING only).
 - `GPIO6` → `GND` (optional) to enable the PulseOx demo.
 - `GPIO7` → `GND` (optional) to enable the framebuffer serial trace.
@@ -194,6 +198,25 @@ Notes:
 
 - Deep sleep is a full suspend; wake behaves like a reboot. The firmware prints the wake cause on boot (`WAKE: cause=...`).
 - Touch thresholds are estimated from an initial baseline and may need tuning depending on your electrode size/placement and enclosure.
+
+### Touch actions (while awake)
+
+The same touch sensor used for wake is also used as a simple “one-button” input:
+
+- If the UI is **CONNECTING** (waiting for a Bluetooth connection), a **touch immediately forces deep sleep**.
+- If **GK+ results** are displayed, a **touch disconnects** (if connected) and **blocks GK+ connections** until the next reboot / wake.
+- If **PulseOx results** are displayed, a **touch disconnects** (if connected) and **blocks PulseOx connections** until the next reboot / wake.
+
+After blocking:
+
+- After either device kind is blocked, the UI returns to **CONNECTING**.
+- If **both** GK+ and PulseOx are blocked, the UI shows **GOODBYE**, plays a short animation, then enters deep sleep.
+
+This is implemented as an in-RAM block flag, so it naturally resets on reboot and on deep-sleep wake (which is a reboot).
+
+Demo note:
+
+- The utility screens (NO WIFI / LOW BATTERY / GOODBYE) are part of the **GPIO4 utility carousel**.
 
 ## Known-good TFT config (76x284 narrow panel)
 
@@ -275,11 +298,11 @@ After every build-and-flash, the AI runs `tmp/inspect_demo_frames.py` with the a
 |:---------|:--------|:--------------|
 | GK+ demo screens | `--need-gk --need-trace` | GPIO5 + GPIO7 |
 | PulseOx demo | `--need-pulseox --need-trace` | GPIO6 + GPIO7 |
-| Static screens only (NO WIFI, LOW BATTERY) | `--need-gk --need-trace` | GPIO5 + GPIO7 |
+| Utility screens only (NO WIFI, LOW BATTERY, GOODBYE) | `--need-util --need-trace` | GPIO4 + GPIO7 |
 
 The script:
 
-1. **Sends a `PINS?` query** over serial to ask the firmware for current pin states. The firmware responds with all three pin states, so already-grounded pins are detected instantly without requiring them to be reconnected.
+1. **Sends a `PINS?` query** over serial to ask the firmware for current pin states. The firmware responds with all gate pin states, so already-grounded pins are detected instantly without requiring them to be reconnected.
 2. **Reports which pins are grounded** and which are missing:
 
    ```
@@ -294,7 +317,8 @@ The script:
 
 | Pin | Purpose | Ground to enable |
 |:---:|:--------|:-----------------|
-| GPIO5 | GK+ demo cycle (CONNECTING → NOT KETOSIS → LOW → MID → HIGH → NO WIFI → LOW BATTERY) | GND |
+| GPIO4 | Utility carousel (NO WIFI → LOW BATTERY → GOODBYE) | GND |
+| GPIO5 | GK+ demo cycle (CONNECTING → NOT KETOSIS → LOW → MID → HIGH) | GND |
 | GPIO6 | PulseOx demo | GND |
 | GPIO7 | Framebuffer serial trace | GND |
 
@@ -302,7 +326,7 @@ All pins are configured with `INPUT_PULLUP` — leaving them unconnected disable
 
 ### Changing the gate pins
 
-Edit `kFbTraceGpio` in `esp32/src/fb_trace.h` for the trace pin. The demo gate pins (`kGkDemoGateGpio` on GPIO5, `kPulseOxDemoGateGpio` on GPIO6) are in `main.cpp`.
+Edit `kFbTraceGpio` in `esp32/src/fb_trace.h` for the trace pin. The demo gate pins (`kUtilityDemoGateGpio` on GPIO4, `kGkDemoGateGpio` on GPIO5, `kPulseOxDemoGateGpio` on GPIO6) are in `main.cpp`.
 
 ## Next
 

@@ -84,8 +84,10 @@ static constexpr uint32_t kDemoStepMs = 4500;
 //
 // - GPIO5: GK+ demo cycle (familiar ketosis stages)
 // - GPIO6: Pulse Ox demo screen (LVGL)
+// - GPIO4: Utility demo carousel (NO WIFI / LOW BATTERY / GOOD BYE)
 static constexpr int kGkDemoGateGpio = 5;
 static constexpr int kPulseOxDemoGateGpio = 6;
+static constexpr int kUtilityDemoGateGpio = 4;
 
 // Deep sleep wake source.
 // NOTE: This must be a touch-capable GPIO for your target (ESP32-S3 has many).
@@ -189,9 +191,11 @@ static void drawStatusDots();
 static void drawPulseOxMetrics();
 static bool isGkDemoGateActive();
 static bool isPulseOxDemoGateActive();
+static bool isUtilityDemoGateActive();
 static bool isAnyDemoGateActive();
 static bool isDemoNoWifiScreen();
 static void setBleConnected(bool v);
+static void requestUiStep(int step);
 static void setBacklight(bool on);
 static void setBacklightRaw(bool levelHigh);
 
@@ -206,10 +210,22 @@ enum SleepPolicyState : uint8_t {
 static volatile bool gTouchWakeConfigured = false;
 static volatile uint32_t gTouchWakeThreshold = 0;
 
+// Touch configuration snapshot (for runtime press detection).
+static volatile uint32_t gTouchWakeBaseline = 0;
+static volatile uint32_t gTouchWakeThresholdAbs = 0;
+
+// Touch-driven BLE behavior.
+static volatile bool gBlockGkPlusConnections = false;
+static volatile bool gBlockPulseOxConnections = false;
+static volatile bool gGkDisconnectRequested = false;
+static volatile bool gPulseOxDisconnectRequested = false;
+
 static SleepPolicyState computeSleepPolicyState();
 static uint32_t sleepTimeoutForPolicyState(SleepPolicyState st);
 static void configureTouchWakeIfNeeded();
 static void enterDeepSleepNow(const char* why);
+static bool readTouchActiveNow();
+static void handleTouchPress();
 
 // ---------- Serial frame trace for static screens (GPIO7 gated) ----------
 // Reads pixels back from gPanelFxSprite after a static screen has been drawn,
@@ -283,12 +299,18 @@ static bool isPulseOxDemoGateActive() {
   return digitalRead(kPulseOxDemoGateGpio) == LOW;
 }
 
+static bool isUtilityDemoGateActive() {
+  // LOW means the pin is grounded.
+  return digitalRead(kUtilityDemoGateGpio) == LOW;
+}
+
 static bool isAnyDemoGateActive() {
-  return isGkDemoGateActive() || isPulseOxDemoGateActive();
+  return isGkDemoGateActive() || isPulseOxDemoGateActive() || isUtilityDemoGateActive();
 }
 
 static bool isDemoNoWifiScreen() {
-  return kDemoMode && isAnyDemoGateActive();
+  // Only the GK+ demo or utility demo ever shows the NO WIFI screen.
+  return kDemoMode && (isGkDemoGateActive() || isUtilityDemoGateActive());
 }
 
 static volatile bool gBleConnected = false;
@@ -454,7 +476,7 @@ static void drawPulseOxMetrics() {
   }
 
   auto drawRotatedLabelCCWIntoSprite = [&](TFT_eSprite* dst, int barLeftX, int barTopY, int barW, int barH,
-                                          const char* text, uint16_t fg, uint16_t bg) {
+                                           const char* text, uint16_t fg, uint16_t bg) {
     if (!sLabelSprOk) return;
 
     static constexpr int kKernPx = 2;  // slightly wider letter spacing
@@ -705,7 +727,24 @@ static bool gShowLoading = false;
 static bool gShowNoWifi = false;
 static bool gShowLowBattery = false;
 static bool gShowPulseOx = false;
+static bool gShowGoodbye = false;
 static String gTopStatus = "";
+
+// GOODBYE screen animation.
+// Phase flow: confetti falls -> banner expands -> done (optionally triggers deep sleep).
+enum GoodbyePhase : uint8_t {
+  kGoodbyeNone = 0,
+  kGoodbyeConfetti = 1,
+  kGoodbyeBannerExpand = 2,
+  kGoodbyeDone = 3,
+};
+
+static volatile uint8_t gGoodbyePhase = kGoodbyeNone;
+static volatile uint32_t gGoodbyePhaseStartMs = 0;
+static volatile uint32_t gGoodbyeAnimStartMs = 0;
+static volatile uint32_t gGoodbyeBannerStartMs = 0;
+static volatile bool gGoodbyeAnimDone = false;
+static volatile bool gGoodbyeSleepAfterAnim = false;
 
 // Normal (non-demo) UI control: a background task can request which visual stage
 // should be shown. renderTask() applies the stage changes so RLottie calls are
@@ -869,7 +908,9 @@ static void configureTouchWakeIfNeeded() {
 #endif
   }
 
+  gTouchWakeBaseline = (uint32_t)baseline;
   gTouchWakeThreshold = (uint32_t)thr;
+  gTouchWakeThresholdAbs = (uint32_t)thr;
   touchSleepWakeUpEnable((uint8_t)kWakeTouchGpio, (touch_value_t)thr);
   (void)esp_sleep_enable_touchpad_wakeup();
   gTouchWakeConfigured = true;
@@ -882,6 +923,66 @@ static void configureTouchWakeIfNeeded() {
   Serial.println("SLEEP: touch wake not available in this build");
   gTouchWakeConfigured = true;
 #endif
+}
+
+static bool readTouchActiveNow() {
+#if __has_include(<esp32-hal-touch.h>)
+#if SOC_TOUCH_SENSOR_NUM > 0
+  const touch_value_t v = touchRead((uint8_t)kWakeTouchGpio);
+#if defined(SOC_TOUCH_VERSION_2)
+  // ESP32-S2/S3: higher value tends to indicate touch.
+  const uint32_t thrAbs = gTouchWakeThresholdAbs;
+  if (thrAbs == 0) return false;
+  return (uint32_t)v >= thrAbs;
+#else
+  // ESP32: lower value tends to indicate touch.
+  const uint32_t thrAbs = gTouchWakeThresholdAbs;
+  if (thrAbs == 0) return false;
+  return (uint32_t)v <= thrAbs;
+#endif
+#else
+  return false;
+#endif
+#else
+  return false;
+#endif
+}
+
+static void handleTouchPress() {
+  if (kDemoMode && isAnyDemoGateActive()) return;
+
+  // Snapshot UI step.
+  int req = 4;
+  portENTER_CRITICAL(&gUiMux);
+  req = gUiRequestedStep;
+  portEXIT_CRITICAL(&gUiMux);
+
+  // 1) If waiting for BLE connection, a touch forces sleep.
+  if (computeSleepPolicyState() == kSleepWaitingBle) {
+    enterDeepSleepNow("touch sleep");
+    return;
+  }
+
+  // 2/3) If results are displayed, disconnect + block reconnection until reboot/wake.
+  if (req == 7) {
+    // Pulse Ox results.
+    gBlockPulseOxConnections = true;
+    gPulseOxDisconnectRequested = true;
+    Serial.println("TOUCH: block PulseOx + request disconnect");
+    // Return to connecting screen after blocking.
+    requestUiStep(4);
+    return;
+  }
+
+  if (req == 0 || req == 1 || req == 2 || req == 3 || req == 6) {
+    // GK+ results.
+    gBlockGkPlusConnections = true;
+    gGkDisconnectRequested = true;
+    Serial.println("TOUCH: block GK+ + request disconnect");
+    // Return to connecting screen after blocking.
+    requestUiStep(4);
+    return;
+  }
 }
 
 static void enterDeepSleepNow(const char* why) {
@@ -911,7 +1012,7 @@ static void enterDeepSleepNow(const char* why) {
 #endif
 }
 
-static void drawQrCodeFromText(const char* text, int x0, int y0, int scale, int quiet) {
+static void drawQrCodeFromText(const char* text, int x0, int y0, int scale, int quiet, TFT_eSprite* spr) {
   if (!text || text[0] == '\0') return;
   static constexpr int kQrVersion = 3;
   static constexpr int kQrSize = 4 * kQrVersion + 17;  // 29
@@ -922,16 +1023,21 @@ static void drawQrCodeFromText(const char* text, int x0, int y0, int scale, int 
     // Too much data for the chosen version; clear area and bail.
     const int px = (kQrSize + 2 * quiet) * scale;
     tft.fillRect(x0, y0, px, px, TFT_BLACK);
+    if (spr) spr->fillRect(x0, y0, px, px, TFT_BLACK);
     return;
   }
 
   const int size = qr.size;
   const int px = (size + 2 * quiet) * scale;
   tft.fillRect(x0, y0, px, px, TFT_BLACK);
+  if (spr) spr->fillRect(x0, y0, px, px, TFT_BLACK);
   for (int y = 0; y < size; y++) {
     for (int x = 0; x < size; x++) {
       if (qrcode_getModule(&qr, x, y)) {
         tft.fillRect(x0 + (x + quiet) * scale, y0 + (y + quiet) * scale, scale, scale, TFT_WHITE);
+        if (spr) {
+          spr->fillRect(x0 + (x + quiet) * scale, y0 + (y + quiet) * scale, scale, scale, TFT_WHITE);
+        }
       }
     }
   }
@@ -2257,6 +2363,12 @@ static bool runPulseOxSession(const BleTargetCandidate& target) {
     Serial.println("PO3: handshake complete, waiting for live measurements");
     while (client->isConnected()) {
       if (isAnyDemoGateActive()) break;
+      if (gPulseOxDisconnectRequested) {
+        gPulseOxDisconnectRequested = false;
+        Serial.println("PO3: disconnect requested (touch)");
+        client->disconnect();
+        break;
+      }
       const uint32_t idleMs = millis() - sess.lastFrameAtMs;
       if (idleMs > kPulseOxInactivityDisconnectMs) {
         Serial.println("PO3: no readings for 10s; disconnecting");
@@ -2442,6 +2554,11 @@ static bool runGkPlusSession(const BleTargetCandidate& target) {
   bool sentXfer = false;
   while (client->isConnected()) {
     if (isAnyDemoGateActive()) break;
+    if (gGkDisconnectRequested) {
+      gGkDisconnectRequested = false;
+      Serial.println("GK+: disconnect requested (touch)");
+      break;
+    }
     if (sess.gotReading) break;
 
     const uint32_t elapsed = millis() - t0;
@@ -2482,9 +2599,24 @@ static void gkplusTask(void* /*param*/) {
       continue;
     }
 
+    // If both device kinds are blocked, idle until reboot/wake.
+    if (gBlockGkPlusConnections && gBlockPulseOxConnections) {
+      vTaskDelay(pdMS_TO_TICKS(500));
+      continue;
+    }
+
     requestUiStep(4);
     BleTargetCandidate target;
     if (!scanForSupportedTarget(scan, &target)) {
+      vTaskDelay(pdMS_TO_TICKS(300));
+      continue;
+    }
+
+    if (target.kind == kTargetGkPlus && gBlockGkPlusConnections) {
+      vTaskDelay(pdMS_TO_TICKS(300));
+      continue;
+    }
+    if (target.kind == kTargetPulseOx && gBlockPulseOxConnections) {
       vTaskDelay(pdMS_TO_TICKS(300));
       continue;
     }
@@ -2562,6 +2694,208 @@ static void setLoopToLogLoading() {
 }
 
 static void drawOverlay() {
+  if (gShowGoodbye) {
+    setupKetosisLabelColorsOnce();
+    initPanelFxSpriteOnce();
+
+    TFT_eSprite* spr = gPanelFxSpriteOk ? &gPanelFxSprite : nullptr;
+    applyPanelViewport();
+    const uint32_t now = millis();
+    const uint16_t bg0 = rgb888To565(0x04, 0x09, 0x0F);
+
+    // Avoid visible flashing/tearing: draw the full frame into the sprite when
+    // possible, then push once.
+    if (spr) {
+      spr->fillSprite(bg0);
+    } else {
+      tft.fillRect(0, 0, kPanelW, kPanelH, bg0);
+    }
+
+    auto easeIn01 = [](float x) {
+      x = max(0.0f, min(1.0f, x));
+      // Cubic ease-in.
+      return x * x * x;
+    };
+
+    auto drawPixel = [&](int x, int y, uint16_t c) {
+      if ((unsigned)x >= (unsigned)kPanelW || (unsigned)y >= (unsigned)kPanelH) return;
+      if (spr) spr->drawPixel(x, y, c);
+      else tft.drawPixel(x, y, c);
+    };
+
+    // Ensure animation clock is initialized.
+    if (gGoodbyeAnimStartMs == 0) {
+      gGoodbyeAnimStartMs = now;
+      gGoodbyeBannerStartMs = 0;
+      gGoodbyePhase = kGoodbyeConfetti;
+      gGoodbyePhaseStartMs = now;
+      gGoodbyeAnimDone = false;
+    }
+
+    const uint32_t tAnim = (now >= gGoodbyeAnimStartMs) ? (now - gGoodbyeAnimStartMs) : 0;
+
+    static const uint16_t kConfC0 = gKetosisRed565;
+    static const uint16_t kConfC1 = gKetosisOrange565;
+    static const uint16_t kConfC2 = gKetosisYellow565;
+    static const uint16_t kConfC3 = rgb888To565(0x00, 0xB0, 0xA0);
+    static const uint16_t kConfC4 = rgb888To565(0x50, 0x70, 0xFF);
+
+    // Animation timing.
+    static constexpr uint32_t kConfettiMs = 2500;
+    static constexpr uint32_t kBannerExpandMs = 500;
+    const uint32_t totalMs = kConfettiMs + kBannerExpandMs;
+
+    // Phase is driven purely from time (stable, no flashing on state changes).
+    if (tAnim < kConfettiMs) {
+      gGoodbyePhase = kGoodbyeConfetti;
+    } else if (tAnim < totalMs) {
+      gGoodbyePhase = kGoodbyeBannerExpand;
+    } else {
+      gGoodbyePhase = kGoodbyeDone;
+      gGoodbyeAnimDone = true;
+    }
+
+    // Confetti fall: single continuous "gravity" across the entire screen.
+    // - Starts with none visible (spawns above the top).
+    // - New confetti keeps spawning the entire time.
+    // - One motion model (no staged piecewise motion).
+    const uint32_t tSpawn = min(tAnim, totalMs);
+    const int midY = kPanelH / 2;
+    static constexpr uint32_t kConfettiBottomMs = 1500;  // smaller = heavier/faster
+    static constexpr float kGravityScale = 1.15f;        // additional heaviness
+
+    // Confetti field:
+    // - Start with *no* confetti visible at t=0.
+    // - Spawn from the top only.
+    // - Keep spawning new confetti throughout the whole animation window.
+    // - Density ramps up naturally as more spawns accumulate.
+    auto confettiFallDistancePx = [&](uint32_t ageMs) -> int {
+      // y(t) = 0.5 * g * t^2, with g chosen so y(bottomMs) ~= bottom.
+      const float bottomPx = (float)max(1, (kPanelH - 1));
+      const float t = (float)ageMs;
+      const float denom = (float)max<uint32_t>(1, kConfettiBottomMs);
+      const float g = kGravityScale * (2.0f * bottomPx) / (denom * denom);
+      const float y = 0.5f * g * t * t;
+      return (int)lroundf(y);
+    };
+
+    // +50% more confetti.
+    static constexpr int kMaxConfetti = 315;
+    static constexpr uint32_t kSpawnIntervalMs = 25;  // 40 spawns/sec
+    // Small spawn band keeps pieces near the top so they appear quickly.
+    const int kSpawnBand = max(2, (kPanelH / 10));
+
+    if (tSpawn > 0) {
+      const int totalSpawns = 1 + (int)(tSpawn / kSpawnIntervalMs);
+      const int count = min(kMaxConfetti, totalSpawns);
+      const int firstSpawn = totalSpawns - count;
+
+      for (int s = firstSpawn; s < totalSpawns; s++) {
+        const uint32_t spawnMs = (uint32_t)s * kSpawnIntervalMs;
+        const uint32_t ageMs = (tAnim >= spawnMs) ? (tAnim - spawnMs) : 0;
+        const int dPx = confettiFallDistancePx(ageMs);
+
+        const uint32_t h = 0x9E3779B9u ^ (uint32_t)(s * 2654435761u);
+        const int x = 2 + (int)(h % (uint32_t)(kPanelW - 4));
+        // Start above the visible area so at t=0 nothing is on-screen.
+        const int y0 = -1 - (int)((h >> 8) % (uint32_t)kSpawnBand);
+
+        const int y = y0 + dPx;
+        if (y < 0 || y >= kPanelH) continue;
+
+        const int sel = (int)((h >> 16) % 5u);
+        const uint16_t c = (sel == 0) ? kConfC0 : (sel == 1) ? kConfC1 : (sel == 2) ? kConfC2 : (sel == 3) ? kConfC3 : kConfC4;
+        drawPixel(x, y, c);
+        if ((h & 1u) == 0) drawPixel(x + 1, y + 1, c);
+      }
+    }
+
+    // Heart balloon: visible from the start, but stationary until the confetti
+    // (using the same gravity model) reaches the middle, then rises while
+    // confetti keeps falling.
+    const float bottomPx = (float)max(1, (kPanelH - 1));
+    const float denom = (float)max<uint32_t>(1, kConfettiBottomMs);
+    const float g = kGravityScale * (2.0f * bottomPx) / (denom * denom);
+    const float tTrig = (g > 0.0f) ? sqrtf((2.0f * (float)midY) / g) : (float)kConfettiBottomMs;
+    const uint32_t kBalloonTriggerMs = (uint32_t)max(0.0f, min((float)totalMs, tTrig));
+    // Slow the balloon rise a bit by giving it the whole remaining animation
+    // window (including the banner expand) to get off-screen.
+    const uint32_t balloonEndMs = totalMs;
+    const float bP = (tAnim <= kBalloonTriggerMs || balloonEndMs <= kBalloonTriggerMs)
+              ? 0.0f
+              : easeIn01((float)(min(tAnim, balloonEndMs) - kBalloonTriggerMs) / (float)(balloonEndMs - kBalloonTriggerMs));
+    const int cx = kPanelW / 2;
+    const int startY = 104;
+    // Ensure the balloon and string are fully off-screen before the banner expansion begins.
+    const int endY = -170;
+    const int cy = (int)lroundf((1.0f - bP) * (float)startY + bP * (float)endY);
+    const uint16_t heart = gKetosisRed565;
+    const uint16_t heartHi = rgb888To565(0xFF, 0xA0, 0xA0);
+    if (spr) {
+      spr->fillCircle(cx - 8, cy - 4, 8, heart);
+      spr->fillCircle(cx + 8, cy - 4, 8, heart);
+      spr->fillTriangle(cx - 16, cy - 2, cx + 16, cy - 2, cx, cy + 22, heart);
+      spr->fillCircle(cx - 5, cy - 6, 2, heartHi);
+      spr->drawLine(cx, cy + 22, cx - 6, cy + 40, TFT_LIGHTGREY);
+      spr->drawLine(cx - 6, cy + 40, cx - 3, cy + 58, TFT_LIGHTGREY);
+    } else {
+      tft.fillCircle(cx - 8, cy - 4, 8, heart);
+      tft.fillCircle(cx + 8, cy - 4, 8, heart);
+      tft.fillTriangle(cx - 16, cy - 2, cx + 16, cy - 2, cx, cy + 22, heart);
+      tft.fillCircle(cx - 5, cy - 6, 2, heartHi);
+      tft.drawLine(cx, cy + 22, cx - 6, cy + 40, TFT_LIGHTGREY);
+      tft.drawLine(cx - 6, cy + 40, cx - 3, cy + 58, TFT_LIGHTGREY);
+    }
+
+    // Banner: full-width stripe is visible at all times, and expands vertically
+    // to fill the whole screen over the last 0.5s.
+    const uint32_t tB = (tAnim > kConfettiMs) ? min(tAnim - kConfettiMs, kBannerExpandMs) : 0;
+    const float bT = (kBannerExpandMs > 0) ? ((float)tB / (float)kBannerExpandMs) : 1.0f;
+    const float bannerP = (tAnim >= totalMs) ? 1.0f : easeIn01(bT);
+
+    const int h0 = 20;
+    const int h1 = kPanelH;
+    const int bh = (int)lroundf((1.0f - bannerP) * (float)h0 + bannerP * (float)h1);
+    const int by = (kPanelH - bh) / 2;
+
+    const uint16_t bannerC = rgb888To565(0x00, 0xB0, 0xA0);
+    const uint16_t bannerText = TFT_WHITE;
+
+    if (spr) {
+      spr->fillRect(0, by, kPanelW, bh, bannerC);
+      spr->setTextDatum(MC_DATUM);
+      spr->setTextSize(1);
+      spr->setTextColor(bannerText, bannerC);
+      spr->drawString("GOODBYE", kPanelW / 2, kPanelH / 2);
+    } else {
+      tft.fillRect(0, by, kPanelW, bh, bannerC);
+      tft.setTextDatum(MC_DATUM);
+      tft.setTextSize(1);
+      tft.setTextColor(bannerText, bannerC);
+      tft.drawString("GOODBYE", kPanelW / 2, kPanelH / 2);
+    }
+
+    // Present the sprite in one blit.
+    if (spr) {
+      int ax = 0;
+      int ay = 0;
+      getPanelAbsXY(&ax, &ay);
+      tft.setSwapBytes(kSwapBytesForPushImage);
+      spr->pushSprite(ax, ay);
+    }
+
+    // Avoid spamming FB trace during animation; emit at most ~2 FPS, and always on phase changes.
+    static uint8_t sLastTracePhase = 0;
+    static uint32_t sLastTraceMs = 0;
+    const bool phaseChanged = (sLastTracePhase != gGoodbyePhase);
+    if (phaseChanged || (now - sLastTraceMs) >= 250) {
+      sLastTracePhase = gGoodbyePhase;
+      sLastTraceMs = now;
+      emitStaticScreenTrace();
+    }
+    return;
+  }
+
   if (gShowLowBattery) {
     setupKetosisLabelColorsOnce();
     initPanelFxSpriteOnce();
@@ -2594,7 +2928,7 @@ static void drawOverlay() {
     const int bw = 40, bh = 22, nubW = 4, nubH = 10;
     const int bx = (kPanelW - bw - nubW) / 2;
     const int by = (kPanelH - bannerH - 12) / 2 + bannerH - bh / 2;
-    const uint16_t outlineColor = rgb888To565(0xCC, 0xCC, 0xCC);
+    const uint16_t outlineColor = TFT_WHITE;
     const uint16_t fillColor = gKetosisRed565;
     // Body outline
     tft.drawRect(bx, by, bw, bh, outlineColor);
@@ -2617,11 +2951,11 @@ static void drawOverlay() {
     // Warning text
     tft.setTextDatum(TC_DATUM);
     tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-    tft.drawString("Charge device", kPanelW / 2, by + bh + 14);
+    tft.drawString("CHARGE", kPanelW / 2, by + bh + 14);
     if (spr) {
       spr->setTextDatum(TC_DATUM);
       spr->setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-      spr->drawString("Charge device", kPanelW / 2, by + bh + 14);
+      spr->drawString("CHARGE", kPanelW / 2, by + bh + 14);
     }
 
     tft.setTextDatum(TL_DATUM);
@@ -2665,12 +2999,18 @@ static void drawOverlay() {
       const int qrPx = (29 + 2 * quiet) * scale;
       const int qrX = (kPanelW - qrPx) / 2;
       const int qrY = 104;
-      drawQrCodeFromText("WIFI:T:nopass;S:ble-health-hub;;", qrX, qrY, scale, quiet);
+      drawQrCodeFromText("WIFI:T:nopass;S:ble-health-hub;;", qrX, qrY, scale, quiet, spr);
 
       tft.setTextDatum(TC_DATUM);
       tft.setTextSize(1);
       tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-      tft.drawString("Scan to setup", kPanelW / 2, qrY + qrPx + 8);
+      tft.drawString("SCAN QR", kPanelW / 2, qrY + qrPx + 8);
+      if (spr) {
+        spr->setTextDatum(TC_DATUM);
+        spr->setTextSize(1);
+        spr->setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+        spr->drawString("SCAN QR", kPanelW / 2, qrY + qrPx + 8);
+      }
     } else {
       // WiFiManager setup QR (join the portal AP).
       const int quiet = 2;
@@ -2678,12 +3018,18 @@ static void drawOverlay() {
       const int qrPx = (29 + 2 * quiet) * scale;
       const int qrX = (kPanelW - qrPx) / 2;
       const int qrY = 120;
-      drawQrCodeFromText(gPortalQrPayload, qrX, qrY, scale, quiet);
+      drawQrCodeFromText(gPortalQrPayload, qrX, qrY, scale, quiet, spr);
 
       tft.setTextDatum(TC_DATUM);
       tft.setTextSize(1);
       tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-      tft.drawString("Scan to setup", kPanelW / 2, qrY + qrPx + 8);
+      tft.drawString("SCAN QR", kPanelW / 2, qrY + qrPx + 8);
+      if (spr) {
+        spr->setTextDatum(TC_DATUM);
+        spr->setTextSize(1);
+        spr->setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+        spr->drawString("SCAN QR", kPanelW / 2, qrY + qrPx + 8);
+      }
     }
 
     tft.setTextDatum(TL_DATUM);
@@ -3187,6 +3533,7 @@ static void applyUiStepVisual(int step) {
   gShowNoWifi = false;
   gShowLowBattery = false;
   gShowPulseOx = false;
+  gShowGoodbye = false;
   gSuppressStatusTime = false;
   gLabelFxState = kLabelFxNone;
 
@@ -3289,6 +3636,23 @@ static void applyUiStepVisual(int step) {
       setAllLayersOpacityPct(0.0f);
       break;
     }
+    case 9: {
+      gShowGoodbye = true;
+      gTopStatus = "";
+      gKetosisLabel = "";
+      gKetosisLabelBg = TFT_BLACK;
+      gKetosisLabelFg = TFT_WHITE;
+      setAllLayersOpacityPct(0.0f);
+
+      // Start the GOODBYE animation sequence.
+      gGoodbyePhase = kGoodbyeConfetti;
+      gGoodbyeAnimStartMs = millis();
+      gGoodbyeBannerStartMs = 0;
+      gGoodbyePhaseStartMs = gGoodbyeAnimStartMs;
+      gGoodbyeAnimDone = false;
+      gOverlayDirty = true;
+      break;
+    }
     default:
       break;
   }
@@ -3353,6 +3717,10 @@ static void applyDemoStep(int step) {
       // Visuals handled by applyUiStepVisual().
       break;
     }
+    case 9: {
+      // GOOD BYE (visual-only)
+      break;
+    }
     default:
       break;
   }
@@ -3386,9 +3754,10 @@ static void renderTask(void* /*param*/) {
       if (ch == '\n' || ch == '\r') {
         sCmdBuf[sCmdLen] = '\0';
         if (strcmp(sCmdBuf, "PINS?") == 0) {
-          Serial.printf("PINS: GK(GPIO%d)=%s  PulseOx(GPIO%d)=%s  FBTrace(GPIO%d)=%s\n",
+          Serial.printf("PINS: GK(GPIO%d)=%s  PulseOx(GPIO%d)=%s  Util(GPIO%d)=%s  FBTrace(GPIO%d)=%s\n",
                         kGkDemoGateGpio, isGkDemoGateActive() ? "ON" : "OFF",
                         kPulseOxDemoGateGpio, isPulseOxDemoGateActive() ? "ON" : "OFF",
+                        kUtilityDemoGateGpio, isUtilityDemoGateActive() ? "ON" : "OFF",
                         kFbTraceGpio, fbTraceGateActive() ? "ON" : "OFF");
         }
         sCmdLen = 0;
@@ -3399,17 +3768,22 @@ static void renderTask(void* /*param*/) {
 
     const bool gkGate = isGkDemoGateActive();
     const bool pulseGate = isPulseOxDemoGateActive();
-    const bool anyGate = gkGate || pulseGate;
+    const bool utilGate = isUtilityDemoGateActive();
+    const bool anyGate = gkGate || pulseGate || utilGate;
     static bool sLastGkGate = false;
     static bool sLastPulseGate = false;
-    if (gkGate != sLastGkGate || pulseGate != sLastPulseGate) {
+    static bool sLastUtilGate = false;
+    if (gkGate != sLastGkGate || pulseGate != sLastPulseGate || utilGate != sLastUtilGate) {
       sLastGkGate = gkGate;
       sLastPulseGate = pulseGate;
+      sLastUtilGate = utilGate;
       // Reset demo timing when switching gates/modes.
       gDemoStartMs = 0;
       appliedStep = -1;
-      Serial.printf("DEMO: GK(GPIO%d)=%s  PulseOx(GPIO%d)=%s\n", kGkDemoGateGpio, gkGate ? "ON" : "OFF",
-                    kPulseOxDemoGateGpio, pulseGate ? "ON" : "OFF");
+      Serial.printf("DEMO: GK(GPIO%d)=%s  PulseOx(GPIO%d)=%s  Util(GPIO%d)=%s\n",
+                    kGkDemoGateGpio, gkGate ? "ON" : "OFF",
+                    kPulseOxDemoGateGpio, pulseGate ? "ON" : "OFF",
+                    kUtilityDemoGateGpio, utilGate ? "ON" : "OFF");
     }
 
     // PulseOx demo should run even if RLottie isn't ready.
@@ -3423,14 +3797,31 @@ static void renderTask(void* /*param*/) {
       }
     }
 
+    // Utility demo carousel should run even if RLottie isn't ready.
+    // Priority: PulseOx > Utility > GK+.
+    if (kDemoMode && utilGate && !pulseGate) {
+      if (gDemoStartMs == 0) {
+        gDemoStartMs = now;
+      }
+      static constexpr int kUtilSteps = 3;
+      static constexpr int kUtilOrder[kUtilSteps] = {5, 8, 9};
+      const int idx = (int)(((now - gDemoStartMs) / kDemoStepMs) % kUtilSteps);
+      const int nextStep = kUtilOrder[idx];
+      if (nextStep != appliedStep) {
+        appliedStep = nextStep;
+        Serial.printf("DEMO: step=%d\n", appliedStep);
+        applyDemoStep(appliedStep);
+      }
+    }
+
     if (gLottieReady) {
-      if (kDemoMode && anyGate && !pulseGate) {
+      if (kDemoMode && gkGate && !pulseGate && !utilGate) {
         if (gDemoStartMs == 0) {
           gDemoStartMs = now;
         }
-        static constexpr int kDemoSteps = 7;
-        // GK+ demo cycle: Loading -> Not -> Low -> Mid -> High -> WiFi -> LowBatt
-        static constexpr int kDemoOrder[kDemoSteps] = {4, 0, 1, 2, 3, 5, 8};
+        static constexpr int kDemoSteps = 5;
+        // GK+ demo cycle: Loading -> Not -> Low -> Mid -> High
+        static constexpr int kDemoOrder[kDemoSteps] = {4, 0, 1, 2, 3};
         const int idx = (int)(((now - gDemoStartMs) / kDemoStepMs) % kDemoSteps);
         const int nextStep = kDemoOrder[idx];
         if (nextStep != appliedStep) {
@@ -3476,13 +3867,15 @@ static void renderTask(void* /*param*/) {
     }
 
     if (gLottieReady) {
-      if (gShowNoWifi || gShowLowBattery) {
-        // Static screen: avoid continuously overwriting it with animation pushes.
-        if (gOverlayDirty) {
+      if (gShowNoWifi || gShowLowBattery || gShowGoodbye) {
+        // Static screens: avoid continuously overwriting them with animation pushes.
+        // GOODBYE is animated, so redraw it while its animation is running.
+        const bool goodbyeAnimating = gShowGoodbye && (gGoodbyePhase != kGoodbyeDone);
+        if (gOverlayDirty || goodbyeAnimating) {
           gOverlayDirty = false;
           drawOverlay();
         }
-        vTaskDelay(pdMS_TO_TICKS(50));
+        vTaskDelay(pdMS_TO_TICKS(goodbyeAnimating ? 33 : 50));
         continue;
       }
 
@@ -3772,6 +4165,7 @@ void setup() {
   // Demo gate inputs (active-low). Ground the pin to enable the respective demo.
   pinMode(kGkDemoGateGpio, INPUT_PULLUP);
   pinMode(kPulseOxDemoGateGpio, INPUT_PULLUP);
+  pinMode(kUtilityDemoGateGpio, INPUT_PULLUP);
 #if defined(BOARD_HAS_PSRAM)
   Serial.printf("psramFound()=%s, psram=%u bytes\n", psramFound() ? "true" : "false", (unsigned)ESP.getPsramSize());
 #else
@@ -3905,11 +4299,51 @@ void loop() {
     return;
   }
 
-  // Rendering runs in renderTask(). loop() implements the sleep rules.
+  // Rendering runs in renderTask(). loop() implements the sleep + touch rules.
   static SleepPolicyState sLastPolicy = kSleepNone;
   static uint32_t sPolicySinceMs = 0;
 
+  // Touch press debounce.
+  static bool sTouchWasActive = false;
+  static uint8_t sTouchActiveStreak = 0;
+  static uint32_t sLastTouchPressMs = 0;
+
   const uint32_t now = millis();
+
+  // If both device kinds are blocked, show GOODBYE and sleep after the GOODBYE
+  // animation completes (confetti fall -> banner expand).
+  // Never sleep during demo gates.
+  if (!isAnyDemoGateActive()) {
+    if (gBlockGkPlusConnections && gBlockPulseOxConnections) {
+      requestUiStep(9);
+      gGoodbyeSleepAfterAnim = true;
+    } else {
+      gGoodbyeSleepAfterAnim = false;
+    }
+  } else {
+    gGoodbyeSleepAfterAnim = false;
+  }
+
+  if (gGoodbyeSleepAfterAnim && gGoodbyeAnimDone && computeSleepPolicyState() != kSleepDisabled) {
+    enterDeepSleepNow("goodbye");
+  }
+
+  // Touch handling: rising-edge press with simple debounce.
+  // Note: we use the same threshold as deep-sleep wake.
+  const bool touchActive = readTouchActiveNow();
+  if (touchActive) {
+    if (sTouchActiveStreak < 10) sTouchActiveStreak++;
+  } else {
+    sTouchActiveStreak = 0;
+  }
+
+  const bool touchPress = (!sTouchWasActive && (sTouchActiveStreak >= 2) && (now - sLastTouchPressMs) > 500);
+  sTouchWasActive = touchActive;
+  if (touchPress) {
+    sLastTouchPressMs = now;
+    handleTouchPress();
+  }
+
   const SleepPolicyState st = computeSleepPolicyState();
   const uint32_t timeoutMs = sleepTimeoutForPolicyState(st);
 
@@ -3929,5 +4363,5 @@ void loop() {
     }
   }
 
-  delay(250);
+  delay(50);
 }
