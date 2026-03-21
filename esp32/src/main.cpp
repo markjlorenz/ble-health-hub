@@ -134,8 +134,8 @@ static constexpr int kOverlayTextPadTopPx = 4;
 // the animation every frame (which causes visible flashing).
 static constexpr int kLoadingStatusH = 16;
 
-static float gGluMgDl = 110.0f;
-static float gKetMmolL = 1.2f;
+static float gGluMgDl = 0.0f;
+static float gKetMmolL = 0.0f;
 static bool gGkiOverride = false;
 static float gGkiValue = 0.0f;
 static String gKetosisLabel = "";
@@ -3225,21 +3225,23 @@ static void drawOverlay() {
     const int xKet = 2 + slideX(dKet);
     const int xGki = 2 + slideX(dGki);
 
-    if (!reveal || revealT >= dGlu) {
+    const bool hasGlu = gGluMgDl > 0.0f;
+    const bool hasKet = gKetMmolL > 0.0f;
+    if (hasGlu && (!reveal || revealT >= dGlu)) {
       if (useSprite) {
         drawMetricSprite(2, xGlu, "GLU", String(gGluMgDl, 0));
       } else {
         drawMetricTft(2, xGlu, "GLU", String(gGluMgDl, 0));
       }
     }
-    if (!reveal || revealT >= dKet) {
+    if (hasKet && (!reveal || revealT >= dKet)) {
       if (useSprite) {
         drawMetricSprite(58, xKet, "KET", String(gKetMmolL, 1));
       } else {
         drawMetricTft(58, xKet, "KET", String(gKetMmolL, 1));
       }
     }
-    if (!reveal || revealT >= dGki) {
+    if (hasGlu && hasKet && (!reveal || revealT >= dGki)) {
       if (useSprite) {
         drawMetricSprite(114, xGki, "GKI", String(gki, 1));
       } else {
@@ -3457,7 +3459,6 @@ static void initLottie() {
 
   gAnimStartMs = millis();
   Serial.printf("RLottie: loaded (fps=%.2f frames=%u)\n", gAnimFps, (unsigned)gAnimTotalFrames);
-  showLottieStatus("RLottie: OK", TFT_GREEN);
   gLottieReady = true;
   gOverlayDirty = true;
 
@@ -4143,23 +4144,32 @@ void setup() {
   digitalWrite(TFT_RST, LOW);
 #endif
 
+  // Check the wakeup cause before any delays so we can skip the serial-monitor
+  // wait on sleep wake — this keeps display feedback fast on wake.
+#if __has_include(<esp_sleep.h>)
+  const esp_sleep_wakeup_cause_t wakeCause = esp_sleep_get_wakeup_cause();
+  const bool isWakeFromSleep = (wakeCause != ESP_SLEEP_WAKEUP_UNDEFINED);
+#else
+  const bool isWakeFromSleep = false;
+#endif
+
   Serial.begin(115200);
-  // Give the host time to attach a monitor so we don't miss boot logs.
-  const uint32_t serialWaitMs = 1500;
-  const uint32_t t0 = millis();
-  while (!Serial && (millis() - t0) < serialWaitMs) {
-    delay(10);
+  // On cold boot, give the host time to attach a monitor so we don't miss boot logs.
+  // On sleep wake, skip this entirely — every millisecond counts for fast visual feedback.
+  if (!isWakeFromSleep) {
+    const uint32_t serialWaitMs = 1500;
+    const uint32_t t0 = millis();
+    while (!Serial && (millis() - t0) < serialWaitMs) {
+      delay(10);
+    }
+    delay(50);
   }
-  delay(50);
 
   Serial.println();
   Serial.println("--- boot ---");
 
 #if __has_include(<esp_sleep.h>)
-  {
-    const esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
-    Serial.printf("WAKE: cause=%d\n", (int)cause);
-  }
+  Serial.printf("WAKE: cause=%d\n", (int)wakeCause);
 #endif
 
   // Demo gate inputs (active-low). Ground the pin to enable the respective demo.
@@ -4175,9 +4185,6 @@ void setup() {
 
   setupKetosisLabelColorsOnce();
   updatePortalQrPayload();
-
-  // Configure touch wake early so we can deep sleep from any state.
-  configureTouchWakeIfNeeded();
 
   printDisplayConfig();
 
@@ -4229,6 +4236,10 @@ void setup() {
   // deterministic first frame; this avoids showing controller junk at boot.
   setBacklight(true);
   delay(20);
+
+  // Configure touch wake here (after the display is already lit) so the
+  // 1200ms touch-settle window on touchpad-wake doesn't block visual feedback.
+  configureTouchWakeIfNeeded();
 
   initLottie();
 
