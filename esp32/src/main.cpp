@@ -214,6 +214,14 @@ static volatile uint32_t gTouchWakeThreshold = 0;
 static volatile uint32_t gTouchWakeBaseline = 0;
 static volatile uint32_t gTouchWakeThresholdAbs = 0;
 
+// RTC RAM: survives deep sleep so we can re-arm immediately on touch-wake without
+// a settle window (the user's finger may still be on the pad during boot, which
+// would corrupt a freshly measured baseline).
+#if __has_include(<esp_sleep.h>)
+RTC_DATA_ATTR static bool     sRtcTouchCalibValid = false;
+RTC_DATA_ATTR static uint32_t sRtcTouchThrAbs     = 0;
+#endif
+
 // Touch-driven BLE behavior.
 static volatile bool gBlockGkPlusConnections = false;
 static volatile bool gBlockPulseOxConnections = false;
@@ -841,80 +849,81 @@ static void configureTouchWakeIfNeeded() {
 
 #if __has_include(<esp_sleep.h>) && __has_include(<esp32-hal-touch.h>)
 #if SOC_TOUCH_SENSOR_NUM > 0
-  // Prime touch hardware and estimate a baseline.
-  // NOTE: Arduino-ESP32 semantics differ by SoC:
-  // - ESP32: touchRead falls when touched; threshold is an absolute raw value.
-  // - ESP32-S2/S3: touchRead rises when touched; threshold is an increment.
-  touch_value_t baseline = 0;
-  touch_value_t maxSeen = 0;
-  {
-    // On touch wake, the user may still be touching the pad during boot.
-    // Use a settle window and treat baseline as the *minimum* observed value
-    // (best proxy for "untouched"), so we don't calibrate against a touched pad.
-    uint32_t settleMs = 250;
-#if __has_include(<esp_sleep.h>)
-    if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TOUCHPAD) {
-      settleMs = 1200;
-    }
-#endif
-    touch_value_t minSeen = (touch_value_t)~(touch_value_t)0;
-    const uint32_t t0 = millis();
-    while ((millis() - t0) < settleMs) {
-      const touch_value_t v = touchRead((uint8_t)kWakeTouchGpio);
-      if (v < minSeen) minSeen = v;
-      if (v > maxSeen) maxSeen = v;
-      delay(5);
-    }
-    baseline = (minSeen == (touch_value_t)~(touch_value_t)0) ? (touch_value_t)0 : minSeen;
-  }
-
   touch_value_t thr = (touch_value_t)WAKE_TOUCH_THRESHOLD;
 
-  if (thr == (touch_value_t)0) {
 #if defined(SOC_TOUCH_VERSION_2)
-    // ESP32-S2/S3: Arduino's touchSleepWakeUpEnable() ultimately calls
-    // touch_pad_sleep_set_threshold(), which expects an *absolute* threshold.
-    // We treat our threshold as an *increment* and convert: abs = baseline + inc.
-    // Make the increment noise-aware to avoid spurious wakes if the pad is floating.
-    const touch_value_t noiseDelta = (maxSeen > baseline) ? (touch_value_t)(maxSeen - baseline) : (touch_value_t)0;
+  if (thr == (touch_value_t)0) {
+    // Fast path: if we have a threshold stored from a previous (cold) boot in RTC RAM,
+    // reuse it immediately. This avoids the settle-window problem where the user's
+    // finger is still on the pad right after a touch-wake, which would corrupt the
+    // baseline measurement and produce a threshold too high to ever trigger.
+    if (sRtcTouchCalibValid && sRtcTouchThrAbs > 0) {
+      thr = (touch_value_t)sRtcTouchThrAbs;
+      Serial.printf("SLEEP: touch reusing stored thrAbs=%u\n", (unsigned)sRtcTouchThrAbs);
+    } else {
+      // Cold calibration: measure baseline with a short settle window.
+      touch_value_t baseline = 0;
+      touch_value_t maxSeen  = 0;
+      {
+        touch_value_t minSeen = (touch_value_t)~(touch_value_t)0;
+        const uint32_t t0 = millis();
+        while ((millis() - t0) < 250u) {
+          const touch_value_t v = touchRead((uint8_t)kWakeTouchGpio);
+          if (v < minSeen) minSeen = v;
+          if (v > maxSeen) maxSeen = v;
+          delay(5);
+        }
+        baseline = (minSeen == (touch_value_t)~(touch_value_t)0) ? (touch_value_t)0 : minSeen;
+      }
 
-    // Heuristic: require a bump comfortably above observed noise.
-    // - at least 1/8 of baseline
-    // - at least 4x the observed noise delta
-    // - at least a small absolute floor
-    touch_value_t incA = (touch_value_t)(baseline / (touch_value_t)8);
-    touch_value_t incB = (touch_value_t)(noiseDelta * (touch_value_t)4);
-    touch_value_t incC = (touch_value_t)300;  // floor
-    touch_value_t inc = incA;
-    if (incB > inc) inc = incB;
-    if (incC > inc) inc = incC;
-    if (inc < (touch_value_t)1) inc = (touch_value_t)1;
+      const touch_value_t noiseDelta = (maxSeen > baseline) ? (touch_value_t)(maxSeen - baseline) : (touch_value_t)0;
+      touch_value_t incA = (touch_value_t)(baseline / (touch_value_t)32);
+      touch_value_t incB = (touch_value_t)(noiseDelta + (noiseDelta / (touch_value_t)2));
+      touch_value_t incC = (touch_value_t)75;  // floor
+      touch_value_t inc  = incA;
+      if (incB > inc) inc = incB;
+      if (incC > inc) inc = incC;
+      if (inc < (touch_value_t)1) inc = (touch_value_t)1;
 
-    // If caller provided WAKE_TOUCH_THRESHOLD, treat it as an increment.
-    if ((touch_value_t)WAKE_TOUCH_THRESHOLD != (touch_value_t)0) {
-      inc = (touch_value_t)WAKE_TOUCH_THRESHOLD;
+      const uint32_t thrAbs32 = (uint32_t)baseline + (uint32_t)inc;
+      thr = (touch_value_t)thrAbs32;
+
+      // Persist so subsequent boots (including touch-wakes) can reuse this.
+      sRtcTouchCalibValid = true;
+      sRtcTouchThrAbs     = thrAbs32;
+
+      Serial.printf("SLEEP: touch cold-calib baseline=%u max=%u noiseDelta=%u inc=%u thrAbs=%u\n",
+              (unsigned)baseline, (unsigned)maxSeen, (unsigned)noiseDelta, (unsigned)inc, (unsigned)thrAbs32);
+
+      gTouchWakeBaseline = (uint32_t)baseline;
     }
-
-    // Convert to absolute threshold.
-    const uint32_t thrAbs32 = (uint32_t)baseline + (uint32_t)inc;
-    thr = (touch_value_t)thrAbs32;
-
-    Serial.printf("SLEEP: touch noise baseline=%u max=%u noiseDelta=%u inc=%u thrAbs=%u\n",
-            (unsigned)baseline, (unsigned)maxSeen, (unsigned)noiseDelta, (unsigned)inc, (unsigned)thrAbs32);
-#else
-    // ESP32: threshold is an absolute raw value (lower triggers).
-    thr = (touch_value_t)((uint64_t)baseline * 80u / 100u);  // 80% of baseline
-    if (thr < (touch_value_t)1) thr = (touch_value_t)1;
-#endif
   }
+#else
+  // ESP32: threshold is an absolute raw value (lower triggers).
+  if (thr == (touch_value_t)0) {
+    touch_value_t baseline = 0;
+    {
+      touch_value_t minSeen = (touch_value_t)~(touch_value_t)0;
+      const uint32_t t0 = millis();
+      while ((millis() - t0) < 250u) {
+        const touch_value_t v = touchRead((uint8_t)kWakeTouchGpio);
+        if (v < minSeen) minSeen = v;
+        delay(5);
+      }
+      baseline = (minSeen == (touch_value_t)~(touch_value_t)0) ? (touch_value_t)0 : minSeen;
+    }
+    thr = (touch_value_t)((uint64_t)baseline * 80u / 100u);
+    if (thr < (touch_value_t)1) thr = (touch_value_t)1;
+    gTouchWakeBaseline = (uint32_t)baseline;
+  }
+#endif
 
-  gTouchWakeBaseline = (uint32_t)baseline;
-  gTouchWakeThreshold = (uint32_t)thr;
+  gTouchWakeThreshold    = (uint32_t)thr;
   gTouchWakeThresholdAbs = (uint32_t)thr;
   touchSleepWakeUpEnable((uint8_t)kWakeTouchGpio, (touch_value_t)thr);
   (void)esp_sleep_enable_touchpad_wakeup();
   gTouchWakeConfigured = true;
-  Serial.printf("SLEEP: touch wake enabled gpio=%d baseline=%u thr=%u\n", kWakeTouchGpio, (unsigned)baseline, (unsigned)thr);
+  Serial.printf("SLEEP: touch wake armed gpio=%d thr=%u\n", kWakeTouchGpio, (unsigned)thr);
 #else
   Serial.println("SLEEP: touch sensors not supported on this target");
   gTouchWakeConfigured = true;
@@ -1003,7 +1012,10 @@ static void enterDeepSleepNow(const char* why) {
   WiFi.disconnect(true, false);
   WiFi.mode(WIFI_OFF);
 
-  // Ensure wake source is armed.
+  // Re-arm the touch wake source unconditionally right before sleeping.
+  // The fast path in configureTouchWakeIfNeeded() reuses the RTC-stored threshold
+  // so this is effectively instant (no settle window).
+  gTouchWakeConfigured = false;
   configureTouchWakeIfNeeded();
 
   esp_deep_sleep_start();
